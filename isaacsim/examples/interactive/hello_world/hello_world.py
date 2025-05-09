@@ -9,7 +9,6 @@
 
 from isaacsim.examples.interactive.base_sample import BaseSample
 import numpy as np
-# Can be used to create a new cube or to point to an already existing cube in stage.
 from isaacsim.core.api.objects import DynamicCuboid
 
 class HelloWorld(BaseSample):
@@ -18,23 +17,33 @@ class HelloWorld(BaseSample):
         return
 
     def setup_scene(self):
-        # 初始化3D场景元素
         world = self.get_world()
-        world.scene.add_default_ground_plane()  # 添加默认地面
-        
-        # 创建可交互的蓝色立方体
+        world.scene.add_default_ground_plane()
         fancy_cube = world.scene.add(
             DynamicCuboid(
-                prim_path="/World/random_cube",  # USD舞台中的立方体路径
-                name="fancy_cube",              # 对象唯一标识名称
-                position=np.array([0, 0, 1.0]), # 初始位置（单位：米）
-                scale=np.array([0.5015, 0.5015, 0.5015]),  # XYZ轴缩放比例
-                color=np.array([0, 0, 1.0]),     # RGB颜色值（0-1范围）
+                prim_path="/World/random_cube",
+                name="fancy_cube",
+                position=np.array([0, 0, 1.0]),
+                scale=np.array([0.5015, 0.5015, 0.5015]),
+                color=np.array([0, 0, 1.0]),
             ))
         return
 
     async def setup_post_load(self):
+        self._world = self.get_world()
+        self._cube = self._world.scene.get_object("fancy_cube")
+        self._world.add_physics_callback("sim_step", callback_fn=self.print_cube_info) #callback names have to be unique
         return
+
+    # here we define the physics callback to be called before each physics step, all physics callbacks must take
+    # step_size as an argument
+    def print_cube_info(self, step_size):
+        position, orientation = self._cube.get_world_pose()
+        linear_velocity = self._cube.get_linear_velocity()
+        # will be shown on terminal
+        print("Cube position is : " + str(position))
+        print("Cube's orientation is : " + str(orientation))
+        print("Cube's linear velocity is : " + str(linear_velocity))
 
     async def setup_pre_reset(self):
         return
