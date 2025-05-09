@@ -1,0 +1,113 @@
+[core]
+reloadable = true
+order = 0
+
+[package]
+version = "4.4.8"
+category = "Simulation"
+title = "Isaac Sim Samples"
+description = "Sample extensions for Isaac Sim"
+authors = ["NVIDIA"]
+repository = ""
+keywords = ["isaac", "samples", "manipulation"]
+changelog = "docs/CHANGELOG.md"
+readme = "docs/README.md"
+icon = "data/icon.png"
+preview_image = "data/preview.png"
+writeTarget.kit = true
+
+[dependencies]
+"isaacsim.core.api" = {}
+"isaacsim.core.prims" = {}
+"isaacsim.cortex.behaviors" = {}
+"isaacsim.cortex.framework" = {}
+"isaacsim.examples.browser" = {}
+"isaacsim.gui.components" = {}
+"isaacsim.robot.manipulators" = {}
+"isaacsim.robot.manipulators.examples" = {}
+"isaacsim.robot_motion.motion_generation" = {}
+"isaacsim.robot.policy.examples" = {}
+"isaacsim.examples.extension" = {}
+"omni.graph.action" = {}
+"omni.graph.nodes" = {}
+"omni.graph.core" = {}
+"omni.isaac.dynamic_control" = {}
+"isaacsim.storage.native" = {}
+"isaacsim.robot.wheeled_robots" = {}
+"omni.kit.uiapp" = {}
+"omni.physx" = {}
+
+
+[[python.module]]
+name = "isaacsim.examples.interactive.tests"
+
+
+[[python.module]]
+name = "isaacsim.examples.interactive.kaya_gamepad"
+
+[[python.module]]
+name = "isaacsim.examples.interactive.omnigraph_keyboard"
+
+[[python.module]]
+name = "isaacsim.examples.interactive.follow_target"
+
+[[python.module]]
+name = "isaacsim.examples.interactive.path_planning"
+
+[[python.module]]
+name = "isaacsim.examples.interactive.simple_stack"
+
+[[python.module]]
+name = "isaacsim.examples.interactive.bin_filling"
+
+[[python.module]]
+name = "isaacsim.examples.interactive.robo_factory"
+
+[[python.module]]
+name = "isaacsim.examples.interactive.robo_party"
+
+[[python.module]]
+name = "isaacsim.examples.interactive.hello_world"
+
+[[python.module]]
+name = "isaacsim.examples.interactive.replay_follow_target"
+
+[[python.module]]
+name = "isaacsim.examples.interactive.surface_gripper"
+
+[[python.module]]
+name = "isaacsim.examples.interactive.quadruped"
+
+[[python.module]]
+name = "isaacsim.examples.interactive.user_examples"
+
+[[python.module]]
+name = "isaacsim.examples.interactive.ur10_palletizing"
+
+[[python.module]]
+name = "isaacsim.examples.interactive.franka_cortex"
+
+[[python.module]]
+name = "isaacsim.examples.interactive.humanoid"
+
+[[python.module]]
+name = "isaacsim.examples.interactive.getting_started"
+
+[[test]]
+timeout = 900
+
+stdoutFailPatterns.exclude = [
+    '*[Error] [carb] [Plugin: omni.sensors.nv.lidar.ext.plugin] Dependency: [omni::sensors::lidar::IGenericModelOutputIOFactory v0.1] failed to be resolved.*', # feature not included in Windows
+]
+
+args = [
+    '--/app/settings/fabricDefaultStageFrameHistoryCount = 3',
+    '--/persistent/isaac/asset_root/default = "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/4.5"',
+
+]
+
+[[test]]
+name = "startup"
+args = [
+    '--/app/settings/fabricDefaultStageFrameHistoryCount = 3',
+]
