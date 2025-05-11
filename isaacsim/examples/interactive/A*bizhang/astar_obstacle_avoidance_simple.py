@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-A*算法避障项目 - 修复导入错误版
-使用create_3小车，实现基本的路径规划和避障功能
+A*算法避障项目 - 调试版
+修复起始位置在障碍物内的问题
 """
 
 from isaacsim import SimulationApp
@@ -31,7 +31,7 @@ carb.settings.get_settings().set("/persistent/isaac/asset_root/default", asset_r
 class SimpleAStarPlanner:
     """简化版A*路径规划器"""
     
-    def __init__(self, grid_size=100, cell_size=0.3):  # 增大网格，减小单元尺寸
+    def __init__(self, grid_size=150, cell_size=0.2):  # 增大网格，减小单元尺寸
         self.grid_size = grid_size
         self.cell_size = cell_size
         self.grid = np.zeros((grid_size, grid_size), dtype=np.int32)
@@ -49,24 +49,26 @@ class SimpleAStarPlanner:
     def grid_to_world(self, grid_pos):
         """网格坐标转世界坐标"""
         offset = self.grid_size * self.cell_size / 2
-        world_x = grid_pos[0] * self.cell_size - offset
-        world_y = grid_pos[1] * self.cell_size - offset
+        world_x = grid_pos[0] * self.cell_size - offset + self.cell_size/2
+        world_y = grid_pos[1] * self.cell_size - offset + self.cell_size/2
         return (world_x, world_y)
     
     def add_obstacle(self, center, size):
         """添加障碍物到网格"""
         center_grid = self.world_to_grid(center)
-        radius_grid = int(max(size[0], size[1]) / (2 * self.cell_size)) + 3  # 增加膨胀
+        # 减小膨胀半径
+        radius_x = int(size[0] / (2 * self.cell_size)) + 2
+        radius_y = int(size[1] / (2 * self.cell_size)) + 2
         
         count = 0
-        for i in range(max(0, center_grid[1] - radius_grid), 
-                      min(self.grid_size, center_grid[1] + radius_grid + 1)):
-            for j in range(max(0, center_grid[0] - radius_grid), 
-                          min(self.grid_size, center_grid[0] + radius_grid + 1)):
+        for i in range(max(0, center_grid[1] - radius_y), 
+                      min(self.grid_size, center_grid[1] + radius_y + 1)):
+            for j in range(max(0, center_grid[0] - radius_x), 
+                          min(self.grid_size, center_grid[0] + radius_x + 1)):
                 self.grid[i, j] = 1
                 count += 1
-        print(f"Added obstacle at {center}, marked {count} grid cells")
-    
+        print(f"Added obstacle at {center}, grid center {center_grid}, marked {count} grid cells")
+        
     def heuristic(self, a, b):
         """欧几里得距离启发式"""
         return math.sqrt((a[0] - b[0])**2 + (a[1] - b[1])**2)
@@ -81,11 +83,50 @@ class SimpleAStarPlanner:
         
         # 检查起始点和目标点是否在障碍物内
         if self.grid[start[1], start[0]] == 1:
-            print(f"Warning: Start position {start} is in obstacle!")
-            return []
+            print(f"Error: Start position {start} is in obstacle!")
+            # 尝试找到附近的自由空间
+            for radius in range(1, 10):
+                for dy in range(-radius, radius+1):
+                    for dx in range(-radius, radius+1):
+                        new_start = (start[0] + dx, start[1] + dy)
+                        if (0 <= new_start[0] < self.grid_size and 
+                            0 <= new_start[1] < self.grid_size and 
+                            self.grid[new_start[1], new_start[0]] == 0):
+                            print(f"Found free space near start: {new_start}")
+                            start = new_start
+                            break
+                    else:
+                        continue
+                    break
+                else:
+                    continue
+                break
+            else:
+                print("No free space found near start position!")
+                return []
+                
         if self.grid[goal[1], goal[0]] == 1:
-            print(f"Warning: Goal position {goal} is in obstacle!")
-            return []
+            print(f"Error: Goal position {goal} is in obstacle!")
+            # 尝试找到附近的自由空间
+            for radius in range(1, 10):
+                for dy in range(-radius, radius+1):
+                    for dx in range(-radius, radius+1):
+                        new_goal = (goal[0] + dx, goal[1] + dy)
+                        if (0 <= new_goal[0] < self.grid_size and 
+                            0 <= new_goal[1] < self.grid_size and 
+                            self.grid[new_goal[1], new_goal[0]] == 0):
+                            print(f"Found free space near goal: {new_goal}")
+                            goal = new_goal
+                            break
+                    else:
+                        continue
+                    break
+                else:
+                    continue
+                break
+            else:
+                print("No free space found near goal position!")
+                return []
         
         open_set = PriorityQueue()
         open_set.put((0, start))
@@ -164,8 +205,8 @@ class AvoidanceRobot:
         self.current_path = []
         self.waypoint_index = 0
         # 调整起始和目标位置，确保不在障碍物内
-        self.start_pos = [-12, -12, 0.1]
-        self.goal_pos = [12, 12, 0.1]
+        self.start_pos = [-10, -10, 0.1]
+        self.goal_pos = [10, 10, 0.1]
         self.state = "IDLE"  # 初始状态为IDLE
         
         # 运动状态
@@ -204,13 +245,13 @@ class AvoidanceRobot:
     
     def create_obstacles(self):
         """创建障碍物 - 优化布局确保有可行路径"""
-        # 减少障碍物数量，确保留有足够通道
+        # 减小中心障碍物，增大通道
         obstacles = [
-            {"pos": [0, 0, 0.5], "scale": [4, 4, 1]},      # 中心大方块
-            {"pos": [6, 0, 0.5], "scale": [2, 8, 1]},      # 右侧垂直墙
-            {"pos": [-6, 0, 0.5], "scale": [2, 8, 1]},     # 左侧垂直墙
-            {"pos": [0, 6, 0.5], "scale": [8, 2, 1]},      # 上方水平墙
-            {"pos": [0, -6, 0.5], "scale": [8, 2, 1]},     # 下方水平墙
+            {"pos": [0, 0, 0.5], "scale": [2, 2, 1]},      # 中心方块，变小
+            {"pos": [5, 0, 0.5], "scale": [1, 6, 1]},      # 右侧垂直墙，缩短
+            {"pos": [-5, 0, 0.5], "scale": [1, 6, 1]},     # 左侧垂直墙，缩短
+            {"pos": [0, 5, 0.5], "scale": [6, 1, 1]},      # 上方水平墙，缩短
+            {"pos": [0, -5, 0.5], "scale": [6, 1, 1]},     # 下方水平墙，缩短
         ]
         
         # 创建障碍物，使用 numpy 数组作为颜色
@@ -229,12 +270,12 @@ class AvoidanceRobot:
             self.planner.add_obstacle(obs["pos"], obs["scale"])
             print(f"Created obstacle {i} at {obs['pos']}")
         
-        # 添加边界墙
+        # 减小边界墙，确保起始位置不被覆盖
         boundary_walls = [
-            {"pos": [0, 18, 0.5], "scale": [36, 1, 1]},   # 上边界
-            {"pos": [0, -18, 0.5], "scale": [36, 1, 1]},  # 下边界
-            {"pos": [18, 0, 0.5], "scale": [1, 36, 1]},   # 右边界
-            {"pos": [-18, 0, 0.5], "scale": [1, 36, 1]},  # 左边界
+            {"pos": [0, 13, 0.5], "scale": [26, 1, 1]},   # 上边界
+            {"pos": [0, -13, 0.5], "scale": [26, 1, 1]},  # 下边界
+            {"pos": [13, 0, 0.5], "scale": [1, 26, 1]},   # 右边界
+            {"pos": [-13, 0, 0.5], "scale": [1, 26, 1]},  # 左边界
         ]
         
         for i, wall in enumerate(boundary_walls):
@@ -248,6 +289,17 @@ class AvoidanceRobot:
                 )
             )
             self.planner.add_obstacle(wall["pos"], wall["scale"])
+        
+        # 打印网格调试信息
+        print("\nGrid debug info:")
+        print(f"Grid size: {self.planner.grid_size}x{self.planner.grid_size}")
+        print(f"Cell size: {self.planner.cell_size}")
+        start_grid = self.planner.world_to_grid(self.start_pos)
+        goal_grid = self.planner.world_to_grid(self.goal_pos)
+        print(f"Start position {self.start_pos} -> grid {start_grid}")
+        print(f"Goal position {self.goal_pos} -> grid {goal_grid}")
+        print(f"Start grid value: {self.planner.grid[start_grid[1], start_grid[0]]}")
+        print(f"Goal grid value: {self.planner.grid[goal_grid[1], goal_grid[0]]}")
     
     def plan_path(self):
         """规划路径"""
@@ -260,9 +312,28 @@ class AvoidanceRobot:
         )
         
         if not self.current_path:
-            print("No path found! Staying in current position...")
-            self.state = "IDLE"
-            return False
+            print("No path found! Trying alternate goal position...")
+            # 尝试一个更容易到达的目标位置
+            alternate_goals = [
+                [8, 8, 0.1],
+                [9, 9, 0.1],
+                [7, 7, 0.1]
+            ]
+            
+            for alt_goal in alternate_goals:
+                self.current_path = self.planner.find_path(
+                    [current_pos[0], current_pos[1]], 
+                    [alt_goal[0], alt_goal[1]]
+                )
+                if self.current_path:
+                    print(f"Found path to alternate goal {alt_goal}")
+                    self.goal_pos = alt_goal
+                    break
+            
+            if not self.current_path:
+                print("Still no path found!")
+                self.state = "IDLE"
+                return False
         
         self.waypoint_index = 0
         self.visualize_path()
@@ -272,7 +343,7 @@ class AvoidanceRobot:
     def visualize_path(self):
         """可视化路径"""
         # 清除旧路径
-        for i in range(200):  # 增加清除范围
+        for i in range(300):  # 增加清除范围
             prim_path = f"/World/waypoint_{i}"
             prim = self.world.stage.GetPrimAtPath(prim_path)
             if prim.IsValid():
@@ -469,9 +540,9 @@ def main():
     while simulation_app.is_running():
         try:
             world.step(render=True)
-            
-            # 安全退出机制 - 运行最多60秒
-            if time.time() - start_time > 60:
+
+            # 安全退出机制 - 运行最多180秒
+            if time.time() - start_time > 180:
                 print("Maximum simulation time reached (60 seconds)")
                 break
                 
