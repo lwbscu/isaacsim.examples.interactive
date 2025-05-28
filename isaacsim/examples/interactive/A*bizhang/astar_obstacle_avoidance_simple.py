@@ -179,7 +179,7 @@ class AvoidanceRobot:
         self.world = world
         
         # 加载create_3机器人
-        robot_usd_path = "/home/lwb/isaacsim_assets/Assets/Isaac/4.5/Isaac/Robots/iRobot/create_3.usd"
+        robot_usd_path = "/home/lwb/isaacsim_assets/Assets/Isaac/4.5/Isaac/Robots/iRobot/create_4.usd"
         self.robot_prim_path = "/World/create_3"
         
         # 添加机器人到场景
@@ -541,9 +541,9 @@ def main():
         try:
             world.step(render=True)
 
-            # 安全退出机制 - 运行最多180秒
-            if time.time() - start_time > 180:
-                print("Maximum simulation time reached (60 seconds)")
+            # 安全退出机制 - 运行最多180000秒
+            if time.time() - start_time > 180000:
+                print("Maximum simulation time reached (180000 seconds)")
                 break
                 
         except Exception as e:
