@@ -470,7 +470,7 @@ class InteractiveAvoidanceRobot:
         return True
     
     def visualize_path(self):
-        """可视化路径 - 使用FixedCuboid避免物理系统冲突"""
+        """可视化路径 - 使用高悬浮标记，完全避免物理碰撞"""
         # 清除旧路径
         self.clear_path_markers()
         
@@ -479,41 +479,128 @@ class InteractiveAvoidanceRobot:
             
         print(f"Visualizing path with {len(self.current_path)} waypoints")
         
-        # 使用FixedCuboid标记路径，避免物理冲突
         try:
-            # 仅标记关键路径点，避免创建太多对象
-            path_length = len(self.current_path)
-            step = max(1, path_length // 15)  # 最多显示15个路径点
-            
-            for i in range(0, path_length, step):
-                point = self.current_path[i]
-                marker_path = f"/World/path_marker_{i}"
+            # 简化方案：只创建高悬浮的关键点标记，避免物理碰撞
+            if len(self.current_path) >= 2:
+                # 起点标记（蓝色，悬浮在1.0米高度）
+                start_point = self.current_path[0]
+                elevated_start = [start_point[0], start_point[1], 1.0]
+                self.create_visual_marker("/World/start_marker", elevated_start, [0.0, 0.0, 1.0])
                 
-                # 使用FixedCuboid创建路径标记
-                path_marker = self.world.scene.add(
-                    FixedCuboid(
-                        prim_path=marker_path,
-                        name=f"path_marker_{i}",
-                        position=np.array([point[0], point[1], 0.05]),
-                        scale=np.array([0.15, 0.15, 0.15]),
-                        color=np.array([0.0, 1.0, 0.0])  # 绿色
-                    )
-                )
+                # 终点标记（红色，悬浮在1.0米高度）
+                end_point = self.current_path[-1]
+                elevated_end = [end_point[0], end_point[1], 1.0]
+                self.create_visual_marker("/World/end_marker", elevated_end, [1.0, 0.0, 0.0])
+                
+                # 中间几个关键点（绿色，悬浮在1.2米高度）
+                path_length = len(self.current_path)
+                if path_length > 6:
+                    # 只标记几个关键位置，避免太多对象
+                    key_positions = [
+                        path_length // 4,
+                        path_length // 2,
+                        3 * path_length // 4
+                    ]
+                    
+                    for i, idx in enumerate(key_positions):
+                        if idx < len(self.current_path):
+                            point = self.current_path[idx]
+                            # 标记悬浮在很高的位置，确保机器人不会碰到
+                            elevated_point = [point[0], point[1], 1.2]
+                            self.create_visual_marker(f"/World/key_point_{i}", elevated_point, [0.0, 1.0, 0.0])
+                
+                print("Path visualization: high-floating markers (collision-free)")
             
-            print(f"Path visualization created with {min(path_length//step + 1, 15)} markers")
+            # 在控制台输出路径摘要信息
+            if len(self.current_path) > 0:
+                start = self.current_path[0]
+                end = self.current_path[-1]
+                total_distance = 0
+                for i in range(1, len(self.current_path)):
+                    dx = self.current_path[i][0] - self.current_path[i-1][0]
+                    dy = self.current_path[i][1] - self.current_path[i-1][1]
+                    total_distance += math.sqrt(dx*dx + dy*dy)
+                
+                print(f"📍 Path: {start[0]:.1f},{start[1]:.1f} → {end[0]:.1f},{end[1]:.1f}, Distance: {total_distance:.1f}m")
                 
         except Exception as e:
             print(f"Warning: Could not visualize path: {e}")
+            # 备用方案：仅打印路径信息
+            if self.current_path:
+                print(f"Path summary: {len(self.current_path)} waypoints from {self.current_path[0][:2]} to {self.current_path[-1][:2]}")
+    
+    def create_visual_marker(self, prim_path, position, color):
+        """创建纯视觉标记，不参与物理模拟 - 简化版本"""
+        try:
+            # 删除已存在的prim
+            if self.world.stage.GetPrimAtPath(prim_path).IsValid():
+                self.world.stage.RemovePrim(prim_path)
+            
+            # 使用简单的几何体创建
+            cube_geom = UsdGeom.Cube.Define(self.world.stage, prim_path)
+            
+            # 设置大小
+            cube_geom.CreateSizeAttr(0.1)
+            
+            # 设置位置
+            cube_geom.AddTranslateOp().Set(Gf.Vec3f(position[0], position[1], position[2]))
+            
+            # 设置颜色
+            cube_geom.CreateDisplayColorAttr([(color[0], color[1], color[2])])
+            
+            print(f"Created visual marker at {position[:2]}")
+            
+        except Exception as e:
+            print(f"Failed to create visual marker at {position}: {e}")
+    
+    def create_path_line(self):
+        """创建路径线条可视化 - 简化版本"""
+        try:
+            # 清除旧的路径线
+            line_path = "/World/path_line"
+            if self.world.stage.GetPrimAtPath(line_path).IsValid():
+                self.world.stage.RemovePrim(line_path)
+            
+            if not self.current_path or len(self.current_path) < 2:
+                return
+                
+            print(f"Creating path line with simplified visualization")
+            
+            # 简化方案：只显示关键路径点，不创建复杂线条
+            return True
+            
+        except Exception as e:
+            print(f"Failed to create path line: {e}")
+            return False
     
     def clear_path_markers(self):
-        """清除路径标记"""
+        """清除路径标记 - 改进版本避免名称冲突"""
         try:
-            for i in range(100):  # 清除可能的路径标记
+            # 清除可能的路径标记，使用更大的范围确保清理干净
+            for i in range(200):  # 扩大清理范围
                 marker_path = f"/World/path_marker_{i}"
                 if self.world.stage.GetPrimAtPath(marker_path).IsValid():
                     self.world.stage.RemovePrim(marker_path)
+            
+            # 清除新的标记类型
+            marker_types = [
+                "start_marker", "end_marker", "path_line",
+                "key_point_0", "key_point_1", "key_point_2"
+            ]
+            for marker in marker_types:
+                marker_path = f"/World/{marker}"
+                if self.world.stage.GetPrimAtPath(marker_path).IsValid():
+                    self.world.stage.RemovePrim(marker_path)
+            
+            # 额外清理：删除可能的重复标记
+            for prefix in ["waypoint_", "path_", "marker_"]:
+                for i in range(50):
+                    alt_path = f"/World/{prefix}{i}"
+                    if self.world.stage.GetPrimAtPath(alt_path).IsValid():
+                        self.world.stage.RemovePrim(alt_path)
+                        
         except Exception as e:
-            print(f"Warning: Could not clear path markers: {e}")
+            print(f"Warning: Could not clear all path markers: {e}")
     
     def update(self):
         """更新机器人状态"""
