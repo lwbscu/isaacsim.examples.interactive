@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-A*算法避障项目 - 交互式版本
-支持实时目标选择和拖拽功能
+A*算法避障项目 - 增强交互式版本
+支持实时目标选择、拖拽功能和UI界面
 """
 
 from isaacsim import SimulationApp
@@ -12,6 +12,7 @@ import omni
 import omni.appwindow
 import omni.ui as ui
 import omni.usd
+import omni.timeline
 import os
 import numpy as np
 import math
@@ -173,8 +174,150 @@ class SimpleAStarPlanner:
         print(f"No path found after visiting {visited} nodes")
         return []
 
+class InteractiveUI:
+    """交互式用户界面"""
+    
+    def __init__(self, robot):
+        self.robot = robot
+        self.window = None
+        self.ui_elements = {}
+        self.build_ui()
+    
+    def build_ui(self):
+        """构建用户界面"""
+        try:
+            self.window = ui.Window("A* Interactive Controls", width=350, height=500)
+            
+            with self.window.frame:
+                with ui.VStack(spacing=10):
+                    # 标题
+                    ui.Label("A* 交互式路径规划", height=30, style={"font_size": 18})
+                    ui.Separator()
+                    
+                    # 控制按钮
+                    with ui.CollapsableFrame("控制", collapsed=False):
+                        with ui.VStack(spacing=5):
+                            self.ui_elements["start_btn"] = ui.Button(
+                                "开始导航", 
+                                height=30,
+                                clicked_fn=self._on_start_navigation
+                            )
+                            
+                            self.ui_elements["stop_btn"] = ui.Button(
+                                "停止导航", 
+                                height=30,
+                                clicked_fn=self._on_stop_navigation
+                            )
+                            
+                            self.ui_elements["replan_btn"] = ui.Button(
+                                "重新规划", 
+                                height=30,
+                                clicked_fn=self._on_replan
+                            )
+                            
+                            self.ui_elements["random_target_btn"] = ui.Button(
+                                "随机目标", 
+                                height=30,
+                                clicked_fn=self._on_random_target
+                            )
+                    
+                    # 目标位置控制
+                    with ui.CollapsableFrame("目标位置", collapsed=False):
+                        with ui.VStack(spacing=5):
+                            ui.Label("目标 X 坐标:")
+                            self.ui_elements["target_x"] = ui.FloatSlider(
+                                min=-12, max=12, step=0.5,
+                                value=self.robot.goal_pos[0]
+                            )
+                            self.ui_elements["target_x"].model.add_value_changed_fn(self._on_target_x_changed)
+                            
+                            ui.Label("目标 Y 坐标:")
+                            self.ui_elements["target_y"] = ui.FloatSlider(
+                                min=-12, max=12, step=0.5,
+                                value=self.robot.goal_pos[1]
+                            )
+                            self.ui_elements["target_y"].model.add_value_changed_fn(self._on_target_y_changed)
+                    
+                    # 状态信息
+                    with ui.CollapsableFrame("状态信息", collapsed=False):
+                        with ui.VStack(spacing=5):
+                            self.ui_elements["status_label"] = ui.Label("状态: IDLE")
+                            self.ui_elements["mode_label"] = ui.Label("模式: MANUAL")
+                            self.ui_elements["robot_pos_label"] = ui.Label("机器人位置: (-10, -10)")
+                            self.ui_elements["target_pos_label"] = ui.Label(f"目标位置: ({self.robot.goal_pos[0]:.1f}, {self.robot.goal_pos[1]:.1f})")
+                    
+                    # 键盘快捷键说明
+                    with ui.CollapsableFrame("键盘快捷键", collapsed=True):
+                        with ui.VStack(spacing=2):
+                            ui.Label("方向键: 移动目标")
+                            ui.Label("空格键: 开始/停止导航")
+                            ui.Label("R键: 重新规划路径")
+                            ui.Label("T键: 随机目标位置")
+                            ui.Label("ESC键: 退出程序")
+        except Exception as e:
+            print(f"Failed to create UI: {e}")
+    
+    def update_ui(self):
+        """更新UI显示"""
+        try:
+            if self.ui_elements.get("status_label"):
+                self.ui_elements["status_label"].text = f"状态: {self.robot.state}"
+            
+            if self.ui_elements.get("mode_label"):
+                mode = "AUTO" if self.robot.auto_navigation else "MANUAL"
+                self.ui_elements["mode_label"].text = f"模式: {mode}"
+            
+            if self.ui_elements.get("robot_pos_label"):
+                pos = self.robot.current_position
+                self.ui_elements["robot_pos_label"].text = f"机器人位置: ({pos[0]:.1f}, {pos[1]:.1f})"
+            
+            if self.ui_elements.get("target_pos_label"):
+                self.ui_elements["target_pos_label"].text = f"目标位置: ({self.robot.goal_pos[0]:.1f}, {self.robot.goal_pos[1]:.1f})"
+        except Exception as e:
+            print(f"Failed to update UI: {e}")
+    
+    def _on_start_navigation(self):
+        """开始导航按钮回调"""
+        self.robot.auto_navigation = True
+        self.robot.state = "PLANNING"
+        print("Auto navigation started from UI")
+    
+    def _on_stop_navigation(self):
+        """停止导航按钮回调"""
+        self.robot.auto_navigation = False
+        self.robot.state = "IDLE"
+        print("Auto navigation stopped from UI")
+    
+    def _on_replan(self):
+        """重新规划按钮回调"""
+        if self.robot.auto_navigation:
+            self.robot.state = "PLANNING"
+            print("Replanning requested from UI")
+    
+    def _on_random_target(self):
+        """随机目标按钮回调"""
+        self.robot.set_random_target()
+        # 更新滑块值
+        if self.ui_elements.get("target_x"):
+            self.ui_elements["target_x"].model.set_value(self.robot.goal_pos[0])
+        if self.ui_elements.get("target_y"):
+            self.ui_elements["target_y"].model.set_value(self.robot.goal_pos[1])
+        print("Random target set from UI")
+    
+    def _on_target_x_changed(self, model):
+        """目标X坐标滑块回调"""
+        self.robot.goal_pos[0] = model.get_value_as_float()
+        self.robot.goal_changed = True
+        self.robot.update_target_cube_position()
+    
+    def _on_target_y_changed(self, model):
+        """目标Y坐标滑块回调"""
+        self.robot.goal_pos[1] = model.get_value_as_float()
+        self.robot.goal_changed = True
+        self.robot.update_target_cube_position()
+
 class InteractiveAvoidanceRobot:
-    """交互式避障机器人类"""
+    """增强交互式避障机器人类"""
     
     def __init__(self, world):
         self.world = world
@@ -218,6 +361,11 @@ class InteractiveAvoidanceRobot:
         self.target_cube = None
         self.goal_changed = False
         
+        # 性能统计
+        self.path_planning_time = 0.0
+        self.total_distance_traveled = 0.0
+        self.last_position = np.array(self.start_pos)
+        
         # 输入处理
         self._appwindow = None
         self._input = None
@@ -227,14 +375,14 @@ class InteractiveAvoidanceRobot:
         # 键盘映射
         self._input_keyboard_mapping = {
             # 目标移动
-            "NUMPAD_8": [0, 2.0],    # 向前移动目标
-            "UP": [0, 2.0],
-            "NUMPAD_2": [0, -2.0],   # 向后移动目标
-            "DOWN": [0, -2.0],
-            "NUMPAD_4": [-2.0, 0],   # 向左移动目标
-            "LEFT": [-2.0, 0],
-            "NUMPAD_6": [2.0, 0],    # 向右移动目标
-            "RIGHT": [2.0, 0],
+            "NUMPAD_8": [0, 1.0],    # 向前移动目标
+            "UP": [0, 1.0],
+            "NUMPAD_2": [0, -1.0],   # 向后移动目标
+            "DOWN": [0, -1.0],
+            "NUMPAD_4": [-1.0, 0],   # 向左移动目标
+            "LEFT": [-1.0, 0],
+            "NUMPAD_6": [1.0, 0],    # 向右移动目标
+            "RIGHT": [1.0, 0],
             # 控制键
             "SPACE": "toggle_auto",   # 开始/停止自动导航
             "R": "replan",           # 重新规划路径
@@ -293,27 +441,14 @@ class InteractiveAvoidanceRobot:
         self.update_target_cube_position()
     
     def update_target_cube_position(self):
-        """更新目标立方体的位置 - 使用USD直接操作避免物理后端问题"""
+        """更新目标立方体的位置"""
         if self.target_cube:
             try:
-                # 直接使用USD操作，避免物理后端问题
-                target_prim_path = "/World/target_cube"
-                target_prim = self.world.stage.GetPrimAtPath(target_prim_path)
-                
-                if target_prim.IsValid():
-                    xform = UsdGeom.Xformable(target_prim)
-                    # 清除现有变换
-                    xform.ClearXformOpOrder()
-                    # 设置新位置
-                    translate_op = xform.AddTranslateOp()
-                    translate_op.Set(Gf.Vec3d(self.goal_pos[0], self.goal_pos[1], 0.2))
-                    print(f"Target cube updated to position: {self.goal_pos[:2]}")
-                else:
-                    print("Warning: Target cube prim not found")
+                self.target_cube.set_world_pose(
+                    position=np.array([self.goal_pos[0], self.goal_pos[1], 0.2])
+                )
             except Exception as e:
                 print(f"Failed to update target cube position: {e}")
-                # 如果更新失败，尝试重新创建目标立方体
-                self.recreate_target_cube()
     
     def toggle_auto_navigation(self):
         """切换自动导航模式"""
@@ -322,7 +457,7 @@ class InteractiveAvoidanceRobot:
             print("Auto navigation ENABLED - Robot will follow the target")
             self.state = "PLANNING"
         else:
-            print("Auto navigation DISABLED - Use arrow keys to move target, SPACE to start")
+            print("Auto navigation DISABLED - Use controls to move target")
             self.state = "IDLE"
     
     def request_replan(self):
@@ -366,28 +501,6 @@ class InteractiveAvoidanceRobot:
         """获取机器人当前位置"""
         return self.current_position.copy(), self.current_orientation
     
-    def recreate_target_cube(self):
-        """重新创建目标立方体"""
-        try:
-            # 删除旧的目标立方体
-            target_prim_path = "/World/target_cube"
-            if self.world.stage.GetPrimAtPath(target_prim_path).IsValid():
-                self.world.stage.RemovePrim(target_prim_path)
-            
-            # 创建新的目标立方体，使用FixedCuboid避免物理问题
-            self.target_cube = self.world.scene.add(
-                FixedCuboid(
-                    prim_path="/World/target_cube",
-                    name="target_cube",
-                    position=np.array([self.goal_pos[0], self.goal_pos[1], 0.2]),
-                    scale=np.array([0.5, 0.5, 0.5]),
-                    color=np.array([1.0, 1.0, 0.0])  # 黄色
-                )
-            )
-            print("Target cube recreated successfully")
-        except Exception as e:
-            print(f"Failed to recreate target cube: {e}")
-
     def create_obstacles(self):
         """创建障碍物"""
         obstacles = [
@@ -433,24 +546,22 @@ class InteractiveAvoidanceRobot:
             )
             self.planner.add_obstacle(wall["pos"], wall["scale"])
         
-        # 创建可交互的目标立方体 - 使用FixedCuboid避免物理问题
-        try:
-            self.target_cube = self.world.scene.add(
-                FixedCuboid(
-                    prim_path="/World/target_cube",
-                    name="target_cube",
-                    position=np.array([self.goal_pos[0], self.goal_pos[1], 0.2]),
-                    scale=np.array([0.5, 0.5, 0.5]),
-                    color=np.array([1.0, 1.0, 0.0])  # 黄色
-                )
+        # 创建可交互的目标立方体
+        self.target_cube = self.world.scene.add(
+            DynamicCuboid(
+                prim_path="/World/target_cube",
+                name="target_cube",
+                position=np.array([self.goal_pos[0], self.goal_pos[1], 0.2]),
+                scale=np.array([0.6, 0.6, 0.6]),
+                color=np.array([1.0, 1.0, 0.0])  # 黄色
             )
-            print("Created interactive target cube - use arrow keys to move it!")
-        except Exception as e:
-            print(f"Failed to create target cube: {e}")
-            self.target_cube = None
+        )
+        print("Created interactive target cube!")
     
     def plan_path(self):
         """规划路径"""
+        start_time = time.time()
+        
         current_pos, _ = self.get_robot_pose()
         print(f"Planning path from {current_pos[:2]} to {self.goal_pos[:2]}")
         
@@ -459,6 +570,8 @@ class InteractiveAvoidanceRobot:
             [self.goal_pos[0], self.goal_pos[1]]
         )
         
+        self.path_planning_time = time.time() - start_time
+        
         if not self.current_path:
             print("No path found!")
             self.state = "IDLE"
@@ -466,57 +579,55 @@ class InteractiveAvoidanceRobot:
         
         self.waypoint_index = 0
         self.visualize_path()
-        print(f"Path planned with {len(self.current_path)} waypoints")
+        print(f"Path planned with {len(self.current_path)} waypoints in {self.path_planning_time:.3f}s")
         return True
     
     def visualize_path(self):
-        """可视化路径 - 使用FixedCuboid避免物理系统冲突"""
+        """可视化路径"""
         # 清除旧路径
-        self.clear_path_markers()
+        for i in range(300):
+            prim_path = f"/World/waypoint_{i}"
+            prim = self.world.stage.GetPrimAtPath(prim_path)
+            if prim.IsValid():
+                self.world.stage.RemovePrim(prim_path)
         
-        if not self.current_path:
-            return
-            
-        print(f"Visualizing path with {len(self.current_path)} waypoints")
+        # 清除旧的标记
+        for marker in ["/World/goal_marker", "/World/start_marker"]:
+            marker_prim = self.world.stage.GetPrimAtPath(marker)
+            if marker_prim.IsValid():
+                self.world.stage.RemovePrim(marker)
         
-        # 使用FixedCuboid标记路径，避免物理冲突
-        try:
-            # 仅标记关键路径点，避免创建太多对象
-            path_length = len(self.current_path)
-            step = max(1, path_length // 15)  # 最多显示15个路径点
-            
-            for i in range(0, path_length, step):
-                point = self.current_path[i]
-                marker_path = f"/World/path_marker_{i}"
-                
-                # 使用FixedCuboid创建路径标记
-                path_marker = self.world.scene.add(
-                    FixedCuboid(
-                        prim_path=marker_path,
-                        name=f"path_marker_{i}",
-                        position=np.array([point[0], point[1], 0.05]),
+        # 添加起始点标记
+        self.world.scene.add(
+            DynamicCuboid(
+                prim_path="/World/start_marker",
+                name="start_marker",
+                position=np.array([self.start_pos[0], self.start_pos[1], 0.2]),
+                scale=np.array([0.3, 0.3, 0.3]),
+                color=np.array([0, 1, 1])  # 青色
+            )
+        )
+        
+        # 添加路径点
+        for i, point in enumerate(self.current_path):
+            if i % 3 == 0:  # 每隔3个点显示一个
+                self.world.scene.add(
+                    DynamicCuboid(
+                        prim_path=f"/World/waypoint_{i}",
+                        name=f"waypoint_{i}",
+                        position=np.array([point[0], point[1], 0.1]),
                         scale=np.array([0.15, 0.15, 0.15]),
-                        color=np.array([0.0, 1.0, 0.0])  # 绿色
+                        color=np.array([0, 1, 0])  # 绿色
                     )
                 )
-            
-            print(f"Path visualization created with {min(path_length//step + 1, 15)} markers")
-                
-        except Exception as e:
-            print(f"Warning: Could not visualize path: {e}")
-    
-    def clear_path_markers(self):
-        """清除路径标记"""
-        try:
-            for i in range(100):  # 清除可能的路径标记
-                marker_path = f"/World/path_marker_{i}"
-                if self.world.stage.GetPrimAtPath(marker_path).IsValid():
-                    self.world.stage.RemovePrim(marker_path)
-        except Exception as e:
-            print(f"Warning: Could not clear path markers: {e}")
     
     def update(self):
         """更新机器人状态"""
+        # 计算移动距离
+        distance_moved = np.linalg.norm(self.current_position[:2] - self.last_position[:2])
+        self.total_distance_traveled += distance_moved
+        self.last_position = self.current_position.copy()
+        
         # 检查目标是否改变
         if self.goal_changed and self.auto_navigation:
             print("Target changed - replanning...")
@@ -527,12 +638,11 @@ class InteractiveAvoidanceRobot:
             return True
         
         elif self.state == "PLANNING":
-            print("🎯 Planning new path...")
             if self.plan_path():
                 self.state = "MOVING"
-                print("✅ Path planned successfully - Starting navigation...")
+                print("Starting navigation...")
             else:
-                print("❌ Failed to find path!")
+                print("Failed to find path!")
                 self.state = "IDLE"
             return True
         
@@ -540,14 +650,14 @@ class InteractiveAvoidanceRobot:
             return self.follow_path()
         
         elif self.state == "REACHED":
-            print("🎉 Target reached! Waiting for new commands...")
+            print(f"Target reached! Total distance: {self.total_distance_traveled:.2f}m")
             self.state = "IDLE"
             return True
         
         return True
     
     def follow_path(self):
-        """跟随路径 - 改进版本确保机器人实际移动"""
+        """跟随路径"""
         if self.waypoint_index >= len(self.current_path):
             self.state = "REACHED"
             return True
@@ -568,34 +678,26 @@ class InteractiveAvoidanceRobot:
         while angle_diff < -math.pi:
             angle_diff += 2 * math.pi
         
-        # 调试信息 - 更频繁地输出，确保能看到机器人在移动
-        if self.waypoint_index % 5 == 0:  # 每5个航点输出一次调试信息
-            print(f"🤖 Waypoint {self.waypoint_index}/{len(self.current_path)}: "
-                  f"Pos: ({current_pos[0]:.2f}, {current_pos[1]:.2f}), "
-                  f"Target: ({target[0]:.2f}, {target[1]:.2f}), "
-                  f"Distance: {distance:.2f}m, Angle: {math.degrees(angle_diff):.1f}°")
-        
         # 控制逻辑
         if distance < 0.4:  # 到达当前航点
             self.waypoint_index += 1
-            print(f"✅ Reached waypoint {self.waypoint_index-1}, moving to next...")
             if self.waypoint_index >= len(self.current_path):
                 self.state = "REACHED"
                 return True
         
-        # 计算控制命令 - 改进的控制策略
-        if abs(angle_diff) > 0.15:  # 需要转向
-            linear_vel = max(0.1, distance * 0.3)  # 转向时保持前进
-            angular_vel = np.sign(angle_diff) * min(abs(angle_diff) * 3.0, 2.5)
+        # 计算控制命令
+        if abs(angle_diff) > 0.3:  # 需要转向
+            linear_vel = 0.1
+            angular_vel = np.sign(angle_diff) * min(abs(angle_diff) * 1.0, 1.2)
         else:  # 前进
-            linear_vel = min(distance * 1.2, 0.8)  # 增加线速度
-            angular_vel = angle_diff * 1.5
+            linear_vel = min(distance * 0.8, 0.5)
+            angular_vel = angle_diff * 0.8
         
-        # 确保最小速度，避免机器人停滞
-        if linear_vel < 0.08:
-            linear_vel = 0.08
+        # 应用控制
+        command = np.array([linear_vel, angular_vel])
+        action = self.controller.forward(command)
         
-        # 应用控制 - 确保机器人移动
+        # 使用简单的运动学模型更新位置
         dt = 1.0 / 60.0
         
         # 更新角度
@@ -608,10 +710,6 @@ class InteractiveAvoidanceRobot:
         # 应用新位置
         self.set_robot_pose([new_x, new_y, current_pos[2]], new_yaw)
         
-        # 每次移动都输出运动状态
-        if self.waypoint_index % 10 == 0:
-            print(f"🚗 Robot moving: v={linear_vel:.3f}m/s, ω={angular_vel:.3f}rad/s")
-        
         return True
 
 def main():
@@ -623,41 +721,47 @@ def main():
     world.scene.add_default_ground_plane()
     
     # 创建交互式机器人
-    print("Creating interactive robot and obstacles...")
+    print("Creating enhanced interactive robot and obstacles...")
     robot = InteractiveAvoidanceRobot(world)
     robot.create_obstacles()
     
+    # 创建UI界面
+    ui_interface = InteractiveUI(robot)
+    
     # 显示控制说明
-    print("\n" + "="*60)
-    print("INTERACTIVE A* PATHFINDING CONTROLS:")
-    print("="*60)
+    print("\n" + "="*70)
+    print("ENHANCED INTERACTIVE A* PATHFINDING CONTROLS:")
+    print("="*70)
+    print("GUI Controls: Use the control window on the right")
     print("Arrow Keys / NUMPAD: Move target position")
     print("SPACE: Toggle auto navigation ON/OFF")
     print("R: Force replan current path")
     print("T: Set random target position")
     print("ESC: Exit simulation")
-    print("="*60)
+    print("Drag Support: Select target cube in Stage tree and drag it!")
+    print("="*70)
     print(f"Robot starting position: {robot.start_pos[:2]}")
     print(f"Target position: {robot.goal_pos[:2]}")
-    print("Use SPACE to start auto navigation!")
-    print("="*60 + "\n")
+    print("Use UI controls or SPACE to start auto navigation!")
+    print("="*70 + "\n")
     
     step_count = 0
+    ui_update_counter = 0
     
     # 添加物理回调
     def physics_step(step_size):
-        nonlocal step_count
+        nonlocal step_count, ui_update_counter
         step_count += 1
+        ui_update_counter += 1
         
         # 每300步显示一次状态
         if step_count % 300 == 0:
             status = "AUTO" if robot.auto_navigation else "MANUAL"
-            current_pos, _ = robot.get_robot_pose()
-            print(f"Step: {step_count}, Mode: {status}, State: {robot.state}, "
-                  f"Pos: ({current_pos[0]:.2f}, {current_pos[1]:.2f})")
-            
-            if robot.state == "MOVING" and robot.current_path:
-                print(f"   📍 Waypoint: {robot.waypoint_index}/{len(robot.current_path)}")
+            print(f"Step: {step_count}, Mode: {status}, State: {robot.state}, Distance: {robot.total_distance_traveled:.2f}m")
+        
+        # 每30步更新一次UI（约0.5秒）
+        if ui_update_counter % 30 == 0:
+            ui_interface.update_ui()
         
         robot.update()
     
@@ -666,7 +770,7 @@ def main():
     # 重置世界并开始仿真
     world.reset()
     
-    print("Interactive simulation started!")
+    print("Enhanced interactive simulation started!")
     
     # 仿真循环
     start_time = time.time()
@@ -686,7 +790,7 @@ def main():
             break
     
     # 清理并关闭仿真
-    print("Closing simulation...")
+    print("Closing enhanced simulation...")
     simulation_app.close()
 
 if __name__ == "__main__":
