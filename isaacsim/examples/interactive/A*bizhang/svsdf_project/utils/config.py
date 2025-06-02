@@ -3,8 +3,8 @@
 SVSDF轨迹规划系统配置文件
 """
 import numpy as np
-from typing import Dict, Any
-from dataclasses import dataclass
+from typing import Dict, Any, Optional
+from dataclasses import dataclass, field
 
 @dataclass
 class RobotConfig:
@@ -16,14 +16,26 @@ class RobotConfig:
     wheel_base: float = 0.3    # 轮距 (m)
     wheel_radius: float = 0.05 # 车轮半径 (m)
     
+    # 物理参数
+    mass: float = 20.0         # 机器人质量 (kg)
+    
     # 运动约束
     max_linear_velocity: float = 1.0    # 最大线速度 (m/s)
     max_angular_velocity: float = 1.5   # 最大角速度 (rad/s)
     max_linear_acceleration: float = 2.0 # 最大线加速度 (m/s²)
     max_angular_acceleration: float = 3.0 # 最大角加速度 (rad/s²)
     
+    # 兼容性别名
+    max_linear_vel: float = field(init=False)
+    max_angular_vel: float = field(init=False)
+    
     # 安全参数
     safety_margin: float = 0.2  # 安全距离 (m)
+    
+    def __post_init__(self):
+        # 设置别名
+        self.max_linear_vel = self.max_linear_velocity
+        self.max_angular_vel = self.max_angular_velocity
 
 @dataclass
 class PlanningConfig:
@@ -38,9 +50,9 @@ class PlanningConfig:
     polynomial_order: int = 5         # 多项式阶数
     
     # 第一阶段权重
-    stage1_weights: Dict[str, float] = None
+    stage1_weights: Dict[str, float] = field(default_factory=dict)
     # 第二阶段权重  
-    stage2_weights: Dict[str, float] = None
+    stage2_weights: Dict[str, float] = field(default_factory=dict)
     
     # 优化器参数
     max_opt_iterations: int = 100     # 最大优化迭代次数
@@ -70,9 +82,9 @@ class MPCConfig:
     sample_time: float = 0.1          # 采样时间 (s)
     
     # 权重矩阵
-    state_weights: np.ndarray = None  # 状态权重 Q
-    control_weights: np.ndarray = None # 控制权重 R
-    terminal_weights: np.ndarray = None # 终端权重 Qf
+    state_weights: Optional[np.ndarray] = None  # 状态权重 Q
+    control_weights: Optional[np.ndarray] = None # 控制权重 R
+    terminal_weights: Optional[np.ndarray] = None # 终端权重 Qf
     
     def __post_init__(self):
         if self.state_weights is None:
@@ -86,10 +98,10 @@ class MPCConfig:
 class VisualizationConfig:
     """可视化配置参数"""
     # 颜色设置
-    trajectory_color: np.ndarray = np.array([0.2, 0.6, 1.0])      # 蓝色轨迹
-    swept_volume_color: np.ndarray = np.array([1.0, 0.3, 0.3])    # 红色扫掠体积
-    robot_color: np.ndarray = np.array([0.9, 0.7, 0.1])          # 金色机器人
-    obstacle_color: np.ndarray = np.array([0.5, 0.2, 0.8])       # 紫色障碍物
+    trajectory_color: np.ndarray = field(default_factory=lambda: np.array([0.2, 0.6, 1.0]))      # 蓝色轨迹
+    swept_volume_color: np.ndarray = field(default_factory=lambda: np.array([1.0, 0.3, 0.3]))    # 红色扫掠体积
+    robot_color: np.ndarray = field(default_factory=lambda: np.array([0.9, 0.7, 0.1]))          # 金色机器人
+    obstacle_color: np.ndarray = field(default_factory=lambda: np.array([0.5, 0.2, 0.8]))       # 紫色障碍物
     
     # 可视化参数
     trajectory_line_width: float = 3.0

@@ -22,9 +22,10 @@ class MathUtils:
         return angle
     
     @staticmethod
-    @numba.jit(nopython=True)
-    def euclidean_distance(p1: np.ndarray, p2: np.ndarray) -> float:
+    def euclidean_distance(p1, p2) -> float:
         """计算欧几里得距离"""
+        p1 = np.asarray(p1, dtype=np.float64)
+        p2 = np.asarray(p2, dtype=np.float64)
         return np.sqrt(np.sum((p1 - p2) ** 2))
     
     @staticmethod

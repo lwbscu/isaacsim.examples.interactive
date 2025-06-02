@@ -1,13 +1,58 @@
 # core/svsdf_planner.py
 """
-SVSDF轨迹规划器主控制器
-集成四个阶段的完整规划系统
+SVSDF (Swept Volum@dataclass
+class PlanningResult:
+    """规划结果数据结构"""
+    success: bool = False
+    trajectory: Optional[List[np.ndarray]] = None
+    planning_time: float = 0.0
+    swept_volume_info: Optional[Dict] = None
+    performance_metrics: Optional[Dict] = None
+    
+    def __post_init__(self):
+        if self.trajectory is None:
+            self.trajectory = []
+        if self.swept_volume_info is None:
+            self.swept_volume_info = {}
+        if self.performance_metrics is None:
+            self.performance_metrics = {} 轨迹规划器主控制器
+基于扫掠体积感知的高效轨迹规划系统
+
+集成四个阶段：
+1. A*初始路径搜索
+2. MINCO第一阶段优化（轨迹平滑化）
+3. MINCO第二阶段优化（扫掠体积最小化）
+4. MPC实时跟踪控制
+
+核心技术特点：
+- 工业级优化算法（Armijo线搜索、并行计算）
+- 扫掠体积SDF快速计算
+- 高效可视化
+- 实时性能监控和优化
 """
 import numpy as np
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Optional, Callable, Any
 import time
 import asyncio
-from dataclasses import dataclass
+import threading
+from dataclasses import dataclass, field
+from concurrent.futures import ThreadPoolExecutor
+import warnings
+
+try:
+    # Isaac Sim核心API - 可选导入，兼容不同环境
+    from omni.isaac.core.utils.stage import get_current_stage
+    from omni.isaac.core.utils.prims import create_prim, get_prim_at_path
+    from omni.isaac.core.prims import XFormPrim
+    ISAAC_SIM_AVAILABLE = True
+except ImportError:
+    ISAAC_SIM_AVAILABLE = False
+    warnings.warn("Isaac Sim not available, running in standalone mode")
+    # 创建虚拟类以避免导入错误
+    def get_current_stage(): return None
+    def create_prim(path, prim_type): return None
+    def get_prim_at_path(path): return None
+    class XFormPrim: pass
 
 from core.astar_planner import AStarPlanner
 from core.minco_trajectory import MINCOTrajectory

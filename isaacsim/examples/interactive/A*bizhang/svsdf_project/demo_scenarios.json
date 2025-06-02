@@ -1,0 +1,236 @@
+{
+  "basic_navigation": {
+    "name": "基础导航场景",
+    "start_pos": [
+      0.0,
+      0.0,
+      0.1
+    ],
+    "goal_pos": [
+      8.0,
+      8.0,
+      0.1
+    ],
+    "obstacles": [
+      {
+        "type": "circle",
+        "center": [
+          2.0,
+          2.0
+        ],
+        "radius": 0.8
+      },
+      {
+        "type": "circle",
+        "center": [
+          4.0,
+          6.0
+        ],
+        "radius": 1.0
+      },
+      {
+        "type": "circle",
+        "center": [
+          6.0,
+          3.0
+        ],
+        "radius": 0.6
+      },
+      {
+        "type": "rectangle",
+        "center": [
+          3.0,
+          4.0
+        ],
+        "size": [
+          1.5,
+          0.5
+        ]
+      }
+    ],
+    "visualization_quality": "high",
+    "animation_enabled": true
+  },
+  "complex_maze": {
+    "name": "复杂迷宫场景",
+    "start_pos": [
+      -5.0,
+      -5.0,
+      0.1
+    ],
+    "goal_pos": [
+      5.0,
+      5.0,
+      0.1
+    ],
+    "obstacles": [
+      {
+        "type": "rectangle",
+        "center": [
+          0.0,
+          -2.0
+        ],
+        "size": [
+          6.0,
+          0.5
+        ]
+      },
+      {
+        "type": "rectangle",
+        "center": [
+          0.0,
+          2.0
+        ],
+        "size": [
+          6.0,
+          0.5
+        ]
+      },
+      {
+        "type": "rectangle",
+        "center": [
+          -2.0,
+          0.0
+        ],
+        "size": [
+          0.5,
+          3.0
+        ]
+      },
+      {
+        "type": "rectangle",
+        "center": [
+          2.0,
+          0.0
+        ],
+        "size": [
+          0.5,
+          3.0
+        ]
+      },
+      {
+        "type": "circle",
+        "center": [
+          -3.0,
+          -3.0
+        ],
+        "radius": 0.8
+      },
+      {
+        "type": "circle",
+        "center": [
+          3.0,
+          3.0
+        ],
+        "radius": 0.8
+      }
+    ],
+    "visualization_quality": "ultra",
+    "animation_enabled": true
+  },
+  "performance_test": {
+    "name": "性能测试场景",
+    "start_pos": [
+      0.0,
+      0.0,
+      0.1
+    ],
+    "goal_pos": [
+      10.0,
+      0.0,
+      0.1
+    ],
+    "obstacles": [
+      {
+        "type": "circle",
+        "center": [
+          0.8,
+          -0.5
+        ],
+        "radius": 0.3
+      },
+      {
+        "type": "circle",
+        "center": [
+          1.6,
+          0.5
+        ],
+        "radius": 0.3
+      },
+      {
+        "type": "circle",
+        "center": [
+          2.4000000000000004,
+          -0.5
+        ],
+        "radius": 0.3
+      },
+      {
+        "type": "circle",
+        "center": [
+          3.2,
+          0.5
+        ],
+        "radius": 0.3
+      },
+      {
+        "type": "circle",
+        "center": [
+          4.0,
+          -0.5
+        ],
+        "radius": 0.3
+      },
+      {
+        "type": "circle",
+        "center": [
+          4.800000000000001,
+          0.5
+        ],
+        "radius": 0.3
+      },
+      {
+        "type": "circle",
+        "center": [
+          5.6000000000000005,
+          -0.5
+        ],
+        "radius": 0.3
+      },
+      {
+        "type": "circle",
+        "center": [
+          6.4,
+          0.5
+        ],
+        "radius": 0.3
+      },
+      {
+        "type": "circle",
+        "center": [
+          7.2,
+          -0.5
+        ],
+        "radius": 0.3
+      },
+      {
+        "type": "circle",
+        "center": [
+          8.0,
+          0.5
+        ],
+        "radius": 0.3
+      },
+      {
+        "type": "circle",
+        "center": [
+          8.8,
+          -0.5
+        ],
+        "radius": 0.3
+      }
+    ],
+    "visualization_quality": "medium",
+    "animation_enabled": false
+  }
+}
