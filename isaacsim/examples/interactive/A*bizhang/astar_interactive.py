@@ -454,6 +454,9 @@ class InteractiveAvoidanceRobot:
         current_pos, _ = self.get_robot_pose()
         print(f"Planning path from {current_pos[:2]} to {self.goal_pos[:2]}")
         
+        # 先清除旧的路径可视化
+        self.clear_path_markers()
+        
         self.current_path = self.planner.find_path(
             [current_pos[0], current_pos[1]], 
             [self.goal_pos[0], self.goal_pos[1]]
@@ -471,47 +474,56 @@ class InteractiveAvoidanceRobot:
     
     def visualize_path(self):
         """可视化路径 - 使用FixedCuboid避免物理系统冲突"""
-        # 清除旧路径
-        self.clear_path_markers()
-        
         if not self.current_path:
+            print("No path to visualize")
             return
             
-        print(f"Visualizing path with {len(self.current_path)} waypoints")
+        print(f"🎨 Visualizing path with {len(self.current_path)} waypoints")
         
         # 使用FixedCuboid标记路径，避免物理冲突
         try:
-            # 仅标记关键路径点，避免创建太多对象
+            # 显示完整路径，每个路径点都标记
             path_length = len(self.current_path)
-            step = max(1, path_length // 15)  # 最多显示15个路径点
+            created_count = 0
             
-            for i in range(0, path_length, step):
+            for i in range(path_length):
                 point = self.current_path[i]
                 marker_path = f"/World/path_marker_{i}"
                 
-                # 使用FixedCuboid创建路径标记，提高高度到3
-                path_marker = self.world.scene.add(
-                    FixedCuboid(
-                        prim_path=marker_path,
-                        name=f"path_marker_{i}",
-                        position=np.array([point[0], point[1], 3.0]),  # 高度提高到3
-                        scale=np.array([0.15, 0.15, 0.15]),
-                        color=np.array([0.0, 1.0, 0.0])  # 绿色
+                try:
+                    # 使用FixedCuboid创建路径标记，提高高度到3
+                    path_marker = self.world.scene.add(
+                        FixedCuboid(
+                            prim_path=marker_path,
+                            name=f"path_marker_{i}",
+                            position=np.array([point[0], point[1], 3.0]),  # 高度提高到3
+                            scale=np.array([0.15, 0.15, 0.15]),
+                            color=np.array([0.0, 1.0, 0.0])  # 绿色
+                        )
                     )
-                )
+                    created_count += 1
+                except Exception as marker_error:
+                    print(f"Failed to create marker {i}: {marker_error}")
             
-            print(f"Path visualization created with {min(path_length//step + 1, 15)} markers")
+            print(f"✅ Path visualization created with {created_count}/{path_length} markers for complete path")
                 
         except Exception as e:
-            print(f"Warning: Could not visualize path: {e}")
+            print(f"❌ Error: Could not visualize path: {e}")
+            import traceback
+            traceback.print_exc()
     
     def clear_path_markers(self):
         """清除路径标记"""
         try:
-            for i in range(100):  # 清除可能的路径标记
+            cleared_count = 0
+            # 清除所有可能的路径标记，增加范围以适应完整路径显示
+            for i in range(500):  # 增加清除范围，适应更多路径点
                 marker_path = f"/World/path_marker_{i}"
                 if self.world.stage.GetPrimAtPath(marker_path).IsValid():
                     self.world.stage.RemovePrim(marker_path)
+                    cleared_count += 1
+            if cleared_count > 0:
+                print(f"Cleared {cleared_count} old path markers")
         except Exception as e:
             print(f"Warning: Could not clear path markers: {e}")
     
