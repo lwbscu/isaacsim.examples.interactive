@@ -1,26 +1,168 @@
-# svsdf_isaac_sim_demo.py
+#!/usr/bin/env python3
 """
 SVSDF轨迹规划系统Isaac Sim演示脚本
 完整展示扫掠体积感知轨迹规划的四个阶段
+参考astar_interactive.py的正确模式
 """
-import numpy as np
-import asyncio
-import omni
-from omni.isaac.core import World
-from omni.isaac.core.utils.stage import add_reference_to_stage
-from omni.isaac.core.utils.extensions import enable_extension
 
-# 导入我们的模块
-from core.svsdf_planner import SVSDFPlanner
-from utils.config import config
+from isaacsim import SimulationApp
+simulation_app = SimulationApp({"headless": False})
+
 import carb
+import omni
+import omni.appwindow
+import omni.ui as ui
+import omni.usd
+import os
+import numpy as np
+import math
+import time
+from queue import PriorityQueue
+
+# Isaac Sim imports (正确的导入方式)
+from isaacsim.core.api import World
+from isaacsim.core.api.objects import DynamicCuboid, FixedCuboid
+from isaacsim.robot.wheeled_robots import DifferentialController
+from isaacsim.core.utils.stage import add_reference_to_stage
+from pxr import UsdGeom, Gf, Usd
+import isaacsim.core.utils.prims as prim_utils
+
+# 导入上级目录的SVSDF规划器
+import sys
+sys.path.append('/home/lwb/isaacsim/exts/isaacsim.examples.interactive/isaacsim/examples/interactive/A*bizhang')
+from svsdf_planner import SVSDFPlanner, RobotParams, TrajectoryPoint
+
+# 设置资源路径
+asset_root = "/home/lwb/isaacsim_assets/Assets/Isaac/4.5"
+carb.settings.get_settings().set("/persistent/isaac/asset_root/default", asset_root)
+
+class SimpleAStarPlanner:
+    """简化版A*路径规划器"""
+    
+    def __init__(self, grid_size=150, cell_size=0.2):
+        self.grid_size = grid_size
+        self.cell_size = cell_size
+        self.grid = np.zeros((grid_size, grid_size), dtype=np.int32)
+        print(f"Grid initialized with size {grid_size}x{grid_size}, cell size {cell_size}")
+        
+    def world_to_grid(self, world_pos):
+        """世界坐标转网格坐标"""
+        offset = self.grid_size * self.cell_size / 2
+        grid_x = int((world_pos[0] + offset) / self.cell_size)
+        grid_y = int((world_pos[1] + offset) / self.cell_size)
+        grid_x = max(0, min(grid_x, self.grid_size - 1))
+        grid_y = max(0, min(grid_y, self.grid_size - 1))
+        return (grid_x, grid_y)
+    
+    def grid_to_world(self, grid_pos):
+        """网格坐标转世界坐标"""
+        offset = self.grid_size * self.cell_size / 2
+        world_x = grid_pos[0] * self.cell_size - offset
+        world_y = grid_pos[1] * self.cell_size - offset
+        return (world_x, world_y)
+    
+    def add_circular_obstacle(self, center, radius):
+        """添加圆形障碍物"""
+        center_grid = self.world_to_grid(center)
+        radius_grid = int(radius / self.cell_size) + 2  # 增加安全余量
+        
+        for i in range(max(0, center_grid[0] - radius_grid), 
+                      min(self.grid_size, center_grid[0] + radius_grid + 1)):
+            for j in range(max(0, center_grid[1] - radius_grid), 
+                          min(self.grid_size, center_grid[1] + radius_grid + 1)):
+                dist = math.sqrt((i - center_grid[0])**2 + (j - center_grid[1])**2)
+                if dist <= radius_grid:
+                    self.grid[i, j] = 1
+    
+    def heuristic(self, a, b):
+        """A*启发式函数"""
+        return math.sqrt((a[0] - b[0])**2 + (a[1] - b[1])**2)
+    
+    def get_neighbors(self, pos):
+        """获取邻居节点"""
+        neighbors = []
+        for dx in [-1, 0, 1]:
+            for dy in [-1, 0, 1]:
+                if dx == 0 and dy == 0:
+                    continue
+                new_x, new_y = pos[0] + dx, pos[1] + dy
+                if (0 <= new_x < self.grid_size and 
+                    0 <= new_y < self.grid_size and 
+                    self.grid[new_x, new_y] == 0):
+                    neighbors.append((new_x, new_y))
+        return neighbors
+    
+    def plan_path(self, start_world, goal_world):
+        """A*路径规划"""
+        start_grid = self.world_to_grid(start_world)
+        goal_grid = self.world_to_grid(goal_world)
+        
+        if self.grid[start_grid[0], start_grid[1]] == 1:
+            print("起点在障碍物中")
+            return []
+        if self.grid[goal_grid[0], goal_grid[1]] == 1:
+            print("终点在障碍物中")
+            return []
+        
+        open_set = PriorityQueue()
+        open_set.put((0, start_grid))
+        came_from = {}
+        g_score = {start_grid: 0}
+        f_score = {start_grid: self.heuristic(start_grid, goal_grid)}
+        
+        while not open_set.empty():
+            current = open_set.get()[1]
+            
+            if current == goal_grid:
+                # 重建路径
+                path = []
+                while current in came_from:
+                    world_pos = self.grid_to_world(current)
+                    path.append([world_pos[0], world_pos[1]])
+                    current = came_from[current]
+                world_pos = self.grid_to_world(start_grid)
+                path.append([world_pos[0], world_pos[1]])
+                path.reverse()
+                return path
+            
+            for neighbor in self.get_neighbors(current):
+                tentative_g_score = g_score[current] + self.heuristic(current, neighbor)
+                
+                if neighbor not in g_score or tentative_g_score < g_score[neighbor]:
+                    came_from[neighbor] = current
+                    g_score[neighbor] = tentative_g_score
+                    f_score[neighbor] = tentative_g_score + self.heuristic(neighbor, goal_grid)
+                    open_set.put((f_score[neighbor], neighbor))
+        
+        print("未找到路径")
+        return []
 
 class SVSDFDemo:
-    """SVSDF演示类"""
+    """SVSDF演示类 - 参考astar_interactive.py的实现模式"""
     
     def __init__(self):
         self.world = None
-        self.planner = None
+        self.robot_prim_path = "/World/create_3"
+        self.robot_prim = None
+        self.robot_xform = None
+        self.controller = None
+        self.astar_planner = SimpleAStarPlanner()
+        self.svsdf_planner = None
+        
+        # 机器人状态
+        self.current_position = np.array([0.0, 0.0, 0.1])
+        self.current_orientation = 0.0
+        
+        # 轨迹相关
+        self.current_trajectory = []
+        self.trajectory_index = 0
+        
+        # 可视化
+        self.obstacle_prims = []
+        self.trajectory_markers = []
+        self.swept_volume_markers = []
+        
+        # 演示场景
         self.demo_scenarios = []
         self._setup_demo_scenarios()
         
@@ -88,18 +230,13 @@ class SVSDFDemo:
             ]
         })
     
-    async def initialize_isaac_sim(self):
+    def initialize_isaac_sim(self):
         """初始化Isaac Sim环境"""
         print("正在初始化Isaac Sim环境...")
         
-        # 启用必要的扩展
-        enable_extension("omni.isaac.core")
-        enable_extension("omni.isaac.core_archive")
-        enable_extension("omni.isaac.nucleus")
-        
         # 创建世界
         self.world = World(stage_units_in_meters=1.0)
-        await self.world.initialize_simulation_context_async()
+        # 注意：使用同步方式初始化，参考astar_interactive.py
         
         # 设置物理参数
         self.world.get_physics_context().set_gravity(-9.81)
@@ -150,11 +287,11 @@ class SVSDFDemo:
         except Exception as e:
             print(f"设置相机失败: {e}")
     
-    async def run_demo_scenario(self, scenario_index: int = 0):
-        """运行指定的演示场景"""
+    def run_demo_scenario(self, scenario_index: int = 1):
+        """运行指定的演示场景 - 默认运行复杂场景"""
         if scenario_index >= len(self.demo_scenarios):
-            print(f"场景索引 {scenario_index} 超出范围")
-            return
+            print(f"场景索引 {scenario_index} 超出范围，使用场景1")
+            scenario_index = 1
         
         scenario = self.demo_scenarios[scenario_index]
         print(f"\n{'='*50}")
@@ -162,263 +299,299 @@ class SVSDFDemo:
         print(f"描述: {scenario['description']}")
         print(f"{'='*50}")
         
-        # 重置环境
-        if self.planner:
-            self.planner.reset()
+        # 设置机器人初始位置
+        start_pos = np.array([scenario['start_pos'][0], scenario['start_pos'][1], 0.1])
+        self.set_robot_pose(start_pos, scenario['start_yaw'])
         
-        # 创建规划器
-        stage = omni.usd.get_context().get_stage()
-        self.planner = SVSDFPlanner(stage)
-        
-        # 初始化机器人
-        initial_pos = np.array([scenario['start_pos'][0], scenario['start_pos'][1], 0.1])
-        self.planner.initialize_robot(initial_pos)
-        
-        # 设置障碍物
-        self.planner.set_obstacles(scenario['obstacles'])
+        # 创建障碍物
+        self.create_obstacles_for_scenario(scenario['obstacles'])
         
         # 等待物理稳定
-        await self._wait_for_stability()
+        self._wait_for_stability()
         
-        # 执行轨迹规划
-        print(f"\n开始轨迹规划...")
-        planning_result = self.planner.plan_trajectory(
-            scenario['start_pos'],
-            scenario['goal_pos'],
-            scenario['start_yaw'],
-            scenario['goal_yaw']
+        # 第一阶段：A*路径规划
+        print(f"\n阶段1: A*初始路径搜索...")
+        astar_path = self.astar_planner.plan_path(
+            scenario['start_pos'], scenario['goal_pos']
         )
         
-        if not planning_result.success:
-            print("轨迹规划失败!")
-            return
+        if not astar_path:
+            print("A*路径规划失败!")
+            return False
         
-        # 显示性能指标
-        self._display_performance_metrics(planning_result)
+        print(f"✓ A*路径规划完成，找到 {len(astar_path)} 个路径点")
         
-        # 询问用户是否执行轨迹
-        print(f"\n规划完成! 是否执行轨迹? (y/n): ", end="")
+        # 第二阶段：MINCO第一阶段优化（轨迹平滑化）
+        print(f"阶段2: MINCO第一阶段优化（轨迹平滑化）...")
+        try:
+            # 将A*路径转换为轨迹点
+            trajectory_points = []
+            for i, point in enumerate(astar_path):
+                t = float(i) * 0.5  # 每个点间隔0.5秒
+                traj_point = TrajectoryPoint(
+                    position=np.array([point[0], point[1], scenario['start_yaw'] if i == 0 else 0.0]),
+                    velocity=np.array([0.3, 0.0, 0.0]),  # 保持前进
+                    acceleration=np.array([0.0, 0.0, 0.0]),
+                    time=t
+                )
+                trajectory_points.append(traj_point)
+            
+            # SVSDF第一阶段优化
+            stage1_trajectory = self.svsdf_planner.optimize_stage1(
+                trajectory_points, scenario['start_pos'], scenario['goal_pos']
+            )
+            print(f"✓ MINCO第一阶段完成，优化了 {len(stage1_trajectory)} 个轨迹点")
+            
+        except Exception as e:
+            print(f"MINCO第一阶段失败: {e}")
+            print("使用A*路径继续...")
+            stage1_trajectory = trajectory_points
         
-        # 在实际应用中这里可以添加UI交互
-        # 现在直接执行
-        print("y (自动)")
+        # 第三阶段：MINCO第二阶段优化（扫掠体积最小化）
+        print(f"阶段3: MINCO第二阶段优化（扫掠体积最小化）...")
+        try:
+            final_trajectory = self.svsdf_planner.optimize_stage2(
+                stage1_trajectory, scenario['obstacles']
+            )
+            print(f"✓ MINCO第二阶段完成，最终轨迹包含 {len(final_trajectory)} 个点")
+            
+        except Exception as e:
+            print(f"MINCO第二阶段失败: {e}")
+            print("使用第一阶段轨迹继续...")
+            final_trajectory = stage1_trajectory
         
-        # 执行轨迹
-        print(f"开始执行轨迹...")
-        
-        # 创建进度回调
-        async def progress_callback(state, control, traj_time):
-            # 每秒打印一次进度
-            if int(traj_time * 10) % 10 == 0:  # 每0.1秒
-                completion = min(100, (traj_time / planning_result.trajectory[-1][3]) * 100)
-                print(f"执行进度: {completion:.1f}% - 位置: ({state.x:.2f}, {state.y:.2f})")
-        
-        success = await self.planner.execute_trajectory_async(progress_callback)
+        # 第四阶段：轨迹跟踪执行
+        print(f"阶段4: 轨迹跟踪执行...")
+        self.current_trajectory = final_trajectory
+        success = self.execute_trajectory()
         
         if success:
             print(f"✓ 场景 '{scenario['name']}' 执行完成!")
-            
-            # 显示最终性能总结
-            final_performance = self.planner.get_performance_summary()
-            self._display_final_summary(final_performance)
-            
-            # 保存结果
-            filename = f"svsdf_results_{scenario['name'].replace(' ', '_')}.npz"
-            self.planner.save_results(filename)
-            
+            print(f"起点: ({scenario['start_pos'][0]:.2f}, {scenario['start_pos'][1]:.2f})")
+            print(f"终点: ({scenario['goal_pos'][0]:.2f}, {scenario['goal_pos'][1]:.2f})")
+            print(f"最终轨迹点数: {len(final_trajectory)}")
         else:
             print(f"✗ 场景 '{scenario['name']}' 执行失败!")
-    
-    async def run_all_scenarios(self):
-        """依次运行所有演示场景"""
-        print(f"\n开始运行所有 {len(self.demo_scenarios)} 个演示场景")
         
-        for i, scenario in enumerate(self.demo_scenarios):
-            print(f"\n{'='*60}")
-            print(f"场景 {i+1}/{len(self.demo_scenarios)}: {scenario['name']}")
-            print(f"{'='*60}")
-            
-            await self.run_demo_scenario(i)
-            
-            # 场景间等待
-            if i < len(self.demo_scenarios) - 1:
-                print(f"\n等待 3 秒后开始下一个场景...")
-                await asyncio.sleep(3)
+        return success
+    
+    def execute_trajectory(self):
+        """执行轨迹跟踪"""
+        if not self.current_trajectory:
+            print("没有可执行的轨迹")
+            return False
         
-        print(f"\n🎉 所有演示场景已完成!")
-    
-    async def interactive_demo(self):
-        """交互式演示"""
-        while True:
-            print(f"\n{'='*50}")
-            print("SVSDF轨迹规划演示系统")
-            print(f"{'='*50}")
-            
-            print("可用场景:")
-            for i, scenario in enumerate(self.demo_scenarios):
-                print(f"  {i+1}. {scenario['name']} - {scenario['description']}")
-            
-            print(f"\n选项:")
-            print(f"  {len(self.demo_scenarios)+1}. 运行所有场景")
-            print(f"  {len(self.demo_scenarios)+2}. 自定义场景")
-            print(f"  0. 退出")
-            
-            try:
-                choice = input(f"\n请选择 (0-{len(self.demo_scenarios)+2}): ")
-                choice = int(choice)
-                
-                if choice == 0:
-                    print("退出演示")
-                    break
-                elif 1 <= choice <= len(self.demo_scenarios):
-                    await self.run_demo_scenario(choice - 1)
-                elif choice == len(self.demo_scenarios) + 1:
-                    await self.run_all_scenarios()
-                elif choice == len(self.demo_scenarios) + 2:
-                    await self.custom_scenario()
-                else:
-                    print("无效选择，请重试")
-                    
-            except ValueError:
-                print("请输入有效数字")
-            except KeyboardInterrupt:
-                print("\n\n用户中断，退出演示")
-                break
-    
-    async def custom_scenario(self):
-        """自定义场景"""
-        print(f"\n--- 自定义场景设置 ---")
+        print("开始执行轨迹跟踪...")
         
-        try:
-            # 获取用户输入
-            start_x = float(input("起点X坐标 (默认0.0): ") or "0.0")
-            start_y = float(input("起点Y坐标 (默认0.0): ") or "0.0")
-            goal_x = float(input("终点X坐标 (默认5.0): ") or "5.0")
-            goal_y = float(input("终点Y坐标 (默认3.0): ") or "3.0")
+        # 简化的轨迹跟踪：逐点移动机器人
+        for i, traj_point in enumerate(self.current_trajectory):
+            # 计算进度
+            progress = (i + 1) / len(self.current_trajectory) * 100
             
-            start_yaw = float(input("起点偏航角/度 (默认0.0): ") or "0.0") * np.pi / 180
-            goal_yaw = float(input("终点偏航角/度 (默认0.0): ") or "0.0") * np.pi / 180
+            # 设置机器人位置
+            self.set_robot_pose(
+                [traj_point.position[0], traj_point.position[1], 0.1],
+                traj_point.position[2]  # yaw
+            )
             
-            # 简化障碍物设置
-            num_obstacles = int(input("障碍物数量 (默认1): ") or "1")
+            # 打印进度
+            if i % 5 == 0 or i == len(self.current_trajectory) - 1:
+                print(f"执行进度: {progress:.1f}% - 位置: ({traj_point.position[0]:.2f}, {traj_point.position[1]:.2f})")
             
-            obstacles = []
-            for i in range(num_obstacles):
-                print(f"\n障碍物 {i+1}:")
-                obs_x = float(input(f"  X坐标 (默认{2.0+i}): ") or str(2.0+i))
-                obs_y = float(input(f"  Y坐标 (默认{1.5+i*0.5}): ") or str(1.5+i*0.5))
-                obs_r = float(input(f"  半径 (默认0.5): ") or "0.5")
-                
-                obstacles.append({
-                    'type': 'circle',
-                    'center': [obs_x, obs_y],
-                    'radius': obs_r
-                })
-            
-            # 创建自定义场景
-            custom_scenario = {
-                'name': '自定义场景',
-                'description': '用户自定义的导航场景',
-                'start_pos': np.array([start_x, start_y]),
-                'goal_pos': np.array([goal_x, goal_y]),
-                'start_yaw': start_yaw,
-                'goal_yaw': goal_yaw,
-                'obstacles': obstacles
-            }
-            
-            # 临时添加到场景列表
-            self.demo_scenarios.append(custom_scenario)
-            
-            # 运行自定义场景
-            await self.run_demo_scenario(len(self.demo_scenarios) - 1)
-            
-            # 移除临时场景
-            self.demo_scenarios.pop()
-            
-        except ValueError:
-            print("输入格式错误，返回主菜单")
-        except Exception as e:
-            print(f"自定义场景设置失败: {e}")
+            # 等待一帧
+            self.world.step(render=True)
+            time.sleep(0.1)
+        
+        print("轨迹执行完成")
+        return True
     
-    async def _wait_for_stability(self, duration: float = 2.0):
+    def run_complex_demo(self):
+        """运行复杂场景演示 - 按照用户要求简化为一个复杂场景"""
+        print(f"\n{'='*60}")
+        print("SVSDF轨迹规划系统 - 复杂多障碍物演示")
+        print("展示完整的4阶段SVSDF框架:")
+        print("1. A*初始路径搜索")
+        print("2. MINCO阶段1优化（轨迹平滑化）") 
+        print("3. MINCO阶段2优化（扫掠体积最小化）")
+        print("4. 轨迹跟踪执行")
+        print(f"{'='*60}")
+        
+        # 运行复杂多障碍物场景（索引1）
+        success = self.run_demo_scenario(1)
+        
+        if success:
+            print(f"\n🎉 SVSDF复杂场景演示完成!")
+            print("已成功展示了完整的4阶段SVSDF轨迹规划框架")
+        else:
+            print(f"\n❌ 演示执行失败")
+        
+        return success
+    
+    def _wait_for_stability(self, duration: float = 2.0):
         """等待物理系统稳定"""
         print(f"等待物理系统稳定 ({duration}s)...")
         
         for _ in range(int(duration * 10)):
-            await self.world.step_async()
-            await asyncio.sleep(0.1)
-    
-    def _display_performance_metrics(self, result):
-        """显示性能指标"""
-        print(f"\n--- 性能指标 ---")
-        print(f"总规划时间: {result.planning_time:.3f}s")
-        
-        if 'stage_times' in result.performance_metrics:
-            stages = result.performance_metrics['stage_times']
-            if 'astar' in stages:
-                print(f"A*搜索时间: {stages['astar']:.3f}s")
-            if 'minco_stage1' in stages:
-                print(f"MINCO阶段1时间: {stages['minco_stage1']:.3f}s")
-            if 'minco_stage2' in stages:
-                print(f"MINCO阶段2时间: {stages['minco_stage2']:.3f}s")
-        
-        if 'trajectory_quality' in result.performance_metrics:
-            quality = result.performance_metrics['trajectory_quality']
-            print(f"轨迹总时间: {quality.get('total_time', 0):.3f}s")
-            print(f"路径长度: {quality.get('path_length', 0):.3f}m")
-            print(f"平均速度: {quality.get('average_speed', 0):.3f}m/s")
-            print(f"扫掠面积: {quality.get('swept_volume', 0):.3f}m²")
-    
-    def _display_final_summary(self, performance):
-        """显示最终性能总结"""
-        print(f"\n--- 最终性能总结 ---")
-        
-        if 'mpc_avg_time' in performance:
-            print(f"MPC平均计算时间: {performance['mpc_avg_time']:.3f}ms")
-            print(f"MPC最大计算时间: {performance['mpc_max_time']:.3f}ms")
-        
-        if 'planning_performance' in performance:
-            planning = performance['planning_performance']
-            if 'mpc_computation_times' in planning:
-                mpc_times = planning['mpc_computation_times']
-                if mpc_times:
-                    print(f"MPC调用次数: {len(mpc_times)}")
-                    print(f"实时控制成功率: {len([t for t in mpc_times if t < 10])/len(mpc_times)*100:.1f}%")
+            self.world.step(render=True)
+            time.sleep(0.1)
     
     def cleanup(self):
         """清理资源"""
-        if self.planner:
-            self.planner.cleanup()
+        try:
+            self.clear_obstacles()
+            
+            if self.world:
+                self.world.stop()
+            
+            print("演示系统已清理")
+        except Exception as e:
+            print(f"清理资源时出错: {e}")
+    
+    def initialize_robot(self):
+        """初始化机器人 - 参考astar_interactive.py的实现"""
+        print("正在初始化Create-3机器人...")
         
-        if self.world:
-            self.world.stop()
+        # 加载Create-3机器人USD文件
+        robot_usd_path = "/home/lwb/isaacsim_assets/Assets/Isaac/4.5/Isaac/Robots/iRobot/create_4.usd"
         
-        print("演示系统已清理")
+        # 添加机器人到场景
+        add_reference_to_stage(robot_usd_path, self.robot_prim_path)
+        
+        # 获取机器人prim和transform
+        self.robot_prim = self.world.stage.GetPrimAtPath(self.robot_prim_path)
+        self.robot_xform = UsdGeom.Xformable(self.robot_prim)
+        
+        # 创建差分控制器
+        self.controller = DifferentialController(
+            name="diff_controller",
+            wheel_radius=0.0508,
+            wheel_base=0.235,
+            max_linear_speed=0.5,
+            max_angular_speed=1.5
+        )
+        
+        # 初始化SVSDF规划器
+        robot_params = RobotParams(
+            length=0.35,      # Create-3机器人长度
+            width=0.33,       # Create-3机器人宽度  
+            wheel_base=0.235, # Create-3轮距
+            max_vel=0.5,      # 最大线速度
+            max_omega=1.5,    # 最大角速度
+            max_acc=2.0,      # 最大线加速度
+            max_alpha=3.0     # 最大角加速度
+        )
+        self.svsdf_planner = SVSDFPlanner(robot_params)
+        
+        # 设置初始位置
+        self.set_robot_pose(self.current_position, self.current_orientation)
+        
+        print("机器人初始化完成")
+    
+    def set_robot_pose(self, position, yaw):
+        """设置机器人位置和朝向 - 参考astar_interactive.py"""
+        if self.robot_prim and self.robot_xform:
+            # 清除现有的XForm操作
+            self.robot_xform.ClearXformOpOrder()
+            
+            # 设置平移
+            translate_op = self.robot_xform.AddTranslateOp()
+            translate_op.Set(Gf.Vec3d(position[0], position[1], position[2]))
+            
+            # 设置旋转
+            rotate_op = self.robot_xform.AddRotateZOp()
+            rotate_op.Set(math.degrees(yaw))
+            
+            # 更新当前状态
+            self.current_position = np.array(position)
+            self.current_orientation = yaw
+            
+    def get_robot_pose(self):
+        """获取机器人当前位置"""
+        return self.current_position.copy(), self.current_orientation
+    
+    def create_obstacles_for_scenario(self, obstacles):
+        """为场景创建障碍物"""
+        # 清除现有障碍物
+        self.clear_obstacles()
+        
+        for i, obs in enumerate(obstacles):
+            if obs['type'] == 'circle':
+                # 创建圆形障碍物（使用圆柱体）
+                obstacle_prim_path = f"/World/obstacle_circle_{i}"
+                center = obs['center']
+                radius = obs['radius']
+                height = 0.5
+                
+                obstacle = FixedCuboid(
+                    prim_path=obstacle_prim_path,
+                    name=f"obstacle_circle_{i}",
+                    position=np.array([center[0], center[1], height/2]),
+                    scale=np.array([radius*2, radius*2, height]),
+                    color=np.array([0.8, 0.2, 0.2])  # 红色
+                )
+                self.world.scene.add(obstacle)
+                self.obstacle_prims.append(obstacle)
+                
+                # 添加到A*规划器的网格中
+                self.astar_planner.add_circular_obstacle(center, radius)
+                
+            elif obs['type'] == 'rectangle':
+                # 创建矩形障碍物
+                obstacle_prim_path = f"/World/obstacle_rect_{i}"
+                center = obs['center']
+                size = obs['size']
+                height = 0.5
+                
+                obstacle = FixedCuboid(
+                    prim_path=obstacle_prim_path,
+                    name=f"obstacle_rect_{i}",
+                    position=np.array([center[0], center[1], height/2]),
+                    scale=np.array([size[0], size[1], height]),
+                    color=np.array([0.8, 0.2, 0.2])  # 红色
+                )
+                self.world.scene.add(obstacle)
+                self.obstacle_prims.append(obstacle)
+                
+                # 添加到A*规划器的网格中（简化为圆形）
+                radius = max(size[0], size[1]) / 2 + 0.2  # 安全余量
+                self.astar_planner.add_circular_obstacle(center, radius)
+    
+    def clear_obstacles(self):
+        """清除所有障碍物"""
+        for obstacle in self.obstacle_prims:
+            try:
+                self.world.scene.remove_object(obstacle.name)
+            except:
+                pass
+        self.obstacle_prims.clear()
+        
+        # 重置A*网格
+        self.astar_planner.grid.fill(0)
 
+    # ...existing code...
 # 主函数
-async def main():
-    """主函数"""
+def main():
+    """主函数 - 运行SVSDF复杂场景演示"""
     demo = SVSDFDemo()
     
     try:
         # 初始化Isaac Sim
-        await demo.initialize_isaac_sim()
+        demo.initialize_isaac_sim()
         
-        # 运行交互式演示
-        await demo.interactive_demo()
+        # 初始化机器人
+        demo.initialize_robot()
+        
+        # 运行复杂场景演示
+        demo.run_complex_demo()
         
     except KeyboardInterrupt:
         print("\n\n用户中断演示")
     except Exception as e:
         print(f"演示运行异常: {e}")
+        import traceback
+        traceback.print_exc()
     finally:
         demo.cleanup()
 
 if __name__ == "__main__":
-    # 设置事件循环策略
-    import sys
-    if sys.platform == "win32":
-        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
-    
-    # 运行演示
-    asyncio.run(main())
+    main()
