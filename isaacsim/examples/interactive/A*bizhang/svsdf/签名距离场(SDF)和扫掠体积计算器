@@ -1,0 +1,563 @@
+#ifndef SDF_CALCULATOR_H
+#define SDF_CALCULATOR_H
+
+#include <Eigen/Dense>
+#include <vector>
+#include <memory>
+#include <functional>
+
+#ifdef USE_CUDA
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+#endif
+
+/**
+ * @brief 签名距离场(SDF)和扫掠体积计算器
+ * 
+ * 实现论文中的核心算法：
+ * 1. 机器人形状的SDF计算
+ * 2. 轨迹扫掠体积SDF计算  
+ * 3. CUDA加速的并行计算
+ * 4. Armijo线搜索优化
+ */
+class SDFCalculator {
+public:
+    // 网格地图结构
+    struct GridMap {
+        Eigen::MatrixXd data;       // SDF值
+        double resolution;          // 分辨率 (m/pixel)
+        Eigen::Vector2d origin;     // 原点坐标
+        int width, height;          // 地图尺寸
+    };
+
+    // 机器人形状参数
+    struct RobotShape {
+        double length;              // 长度
+        double width;               // 宽度
+        std::vector<Eigen::Vector2d> vertices;  // 顶点（用于精确SDF）
+    };
+
+    SDFCalculator(const RobotShape& robot_shape, double grid_resolution = 0.05);
+    ~SDFCalculator();
+
+    /**
+     * @brief 计算点到机器人的SDF
+     * 
+     * 对于矩形机器人的快速SDF计算：
+     * 
+     * @param point_world 世界坐标系中的点
+     * @param robot_pose 机器人位姿 [x, y, theta]
+     * @return SDF值（负值表示在机器人内部）
+     */
+    double computeRobotSDF(const Eigen::Vector2d& point_world, 
+                          const Eigen::Vector3d& robot_pose) const;
+
+    /**
+     * @brief 计算扫掠体积SDF
+     * 
+     * 对于给定轨迹，计算任意点到扫掠体积的SDF
+     * 使用Armijo线搜索找到最优时间 t*
+     * 
+     * @param query_point 查询点
+     * @param trajectory 轨迹点序列 [x, y, theta, t]
+     * @return 扫掠体积SDF值
+     */
+    double computeSweptVolumeSDF(const Eigen::Vector2d& query_point,
+                                const std::vector<Eigen::Vector4d>& trajectory) const;
+
+    /**
+     * @brief 批量计算扫掠体积SDF（CUDA加速）
+     * 
+     * @param query_points 查询点集合
+     * @param trajectory 轨迹
+     * @param sdf_values 输出SDF值
+     * @return 是否成功
+     */
+    bool computeSweptVolumeSDF_CUDA(const std::vector<Eigen::Vector2d>& query_points,
+                                   const std::vector<Eigen::Vector4d>& trajectory,
+                                   std::vector<double>& sdf_values) const;
+
+    /**
+     * @brief 构建环境障碍物的SDF地图
+     * 
+     * @param obstacles 障碍物列表（圆形障碍物）
+     * @param map_bounds 地图边界 [x_min, y_min, x_max, y_max]
+     * @return SDF网格地图
+     */
+    GridMap buildEnvironmentSDF(const std::vector<Eigen::Vector3d>& obstacles,
+                               const Eigen::Vector4d& map_bounds) const;
+
+    /**
+     * @brief 计算扫掠体积代价
+     * 
+     * 通过积分计算整个轨迹的扫掠体积：
+     * Volume = ∫∫∫ H(-SDF(x,y,z)) dx dy dz
+     * 其中 H 是Heaviside函数
+     * 
+     * @param trajectory 轨迹点序列
+     * @return 扫掠体积大小
+     */
+    double computeSweptVolume(const std::vector<Eigen::Vector4d>& trajectory) const;
+
+    /**
+     * @brief 计算障碍物安全距离代价
+     * 
+     * @param trajectory 轨迹
+     * @param environment_sdf 环境SDF地图
+     * @param safety_margin 安全距离阈值
+     * @return 障碍物代价
+     */
+    double computeObstacleCost(const std::vector<Eigen::Vector4d>& trajectory,
+                              const GridMap& environment_sdf,
+                              double safety_margin = 0.2) const;
+
+    /**
+     * @brief 计算SDF梯度
+     * 
+     * @param point 查询点
+     * @param robot_pose 机器人位姿
+     * @return 梯度向量 [∂SDF/∂x, ∂SDF/∂y]
+     */
+    Eigen::Vector2d computeSDFGradient(const Eigen::Vector2d& point,
+                                      const Eigen::Vector3d& robot_pose) const;
+
+    // 参数设置
+    void setGridResolution(double resolution) { grid_resolution_ = resolution; }
+    void setUseCUDA(bool use_cuda) { use_cuda_ = use_cuda; }
+
+private:
+    RobotShape robot_shape_;
+    double grid_resolution_;
+    bool use_cuda_;
+
+#ifdef USE_CUDA
+    // CUDA相关成员
+    float* d_query_points_;
+    float* d_trajectory_;
+    float* d_sdf_values_;
+    size_t max_points_;
+    size_t max_trajectory_size_;
+#endif
+
+    /**
+     * @brief Armijo线搜索找最优时间
+     * 
+     * 对于查询点p，找到时间t*使得：
+     * t* = argmin_t SDF(p, robot_pose(t))
+     * 
+     * @param query_point 查询点
+     * @param trajectory 轨迹
+     * @return 最优时间
+     */
+    double armijoLineSearch(const Eigen::Vector2d& query_point,
+                           const std::vector<Eigen::Vector4d>& trajectory) const;
+
+    /**
+     * @brief 矩形机器人SDF的快速计算
+     * 
+     * 对于机器人局部坐标系中的点 (x_local, y_local)：
+     * dx = |x_local| - L/2
+     * dy = |y_local| - W/2
+     * 
+     * SDF = sqrt(max(dx,0)² + max(dy,0)²) + min(max(dx,dy), 0)
+     */
+    double rectangleSDF(const Eigen::Vector2d& point_local) const;
+
+    /**
+     * @brief 世界坐标转机器人局部坐标
+     */
+    Eigen::Vector2d worldToRobot(const Eigen::Vector2d& point_world,
+                                const Eigen::Vector3d& robot_pose) const;
+
+    /**
+     * @brief 插值获取轨迹上任意时间的机器人位姿
+     */
+    Eigen::Vector3d interpolateTrajectory(const std::vector<Eigen::Vector4d>& trajectory,
+                                         double time) const;
+
+    // CUDA辅助函数
+#ifdef USE_CUDA
+    bool initializeCUDA(size_t max_points, size_t max_trajectory_size);
+    void cleanupCUDA();
+#endif
+};
+
+// ========== 实现部分 ==========
+
+SDFCalculator::SDFCalculator(const RobotShape& robot_shape, double grid_resolution)
+    : robot_shape_(robot_shape), grid_resolution_(grid_resolution), use_cuda_(false) {
+    
+#ifdef USE_CUDA
+    // 检查CUDA可用性
+    int device_count;
+    cudaError_t error = cudaGetDeviceCount(&device_count);
+    if (error == cudaSuccess && device_count > 0) {
+        use_cuda_ = true;
+        initializeCUDA(10000, 1000);  // 默认最大点数和轨迹长度
+    }
+#endif
+}
+
+SDFCalculator::~SDFCalculator() {
+#ifdef USE_CUDA
+    if (use_cuda_) {
+        cleanupCUDA();
+    }
+#endif
+}
+
+double SDFCalculator::computeRobotSDF(const Eigen::Vector2d& point_world,
+                                     const Eigen::Vector3d& robot_pose) const {
+    /**
+     * 高效的矩形机器人SDF计算
+     * 
+     * 算法步骤：
+     * 1. 将世界坐标转换到机器人局部坐标系
+     * 2. 计算到矩形边界的距离
+     * 3. 返回签名距离
+     */
+    
+    // 转换到机器人局部坐标系
+    Eigen::Vector2d point_local = worldToRobot(point_world, robot_pose);
+    
+    // 计算矩形SDF
+    return rectangleSDF(point_local);
+}
+
+double SDFCalculator::rectangleSDF(const Eigen::Vector2d& point_local) const {
+    /**
+     * 矩形SDF计算公式（论文Equation 7）：
+     * 
+     * dx = |x_local| - L/2
+     * dy = |y_local| - W/2
+     * 
+     * if (dx > 0 && dy > 0):
+     *     SDF = sqrt(dx² + dy²)     // 外部角点
+     * else:
+     *     SDF = max(dx, dy)         // 边界或内部
+     */
+    
+    double L = robot_shape_.length;
+    double W = robot_shape_.width;
+    
+    double dx = std::abs(point_local.x()) - L / 2.0;
+    double dy = std::abs(point_local.y()) - W / 2.0;
+    
+    if (dx > 0.0 && dy > 0.0) {
+        // 外部角点：欧几里得距离
+        return std::sqrt(dx * dx + dy * dy);
+    } else {
+        // 边界或内部：切比雪夫距离
+        return std::max(dx, dy);
+    }
+}
+
+Eigen::Vector2d SDFCalculator::worldToRobot(const Eigen::Vector2d& point_world,
+                                          const Eigen::Vector3d& robot_pose) const {
+    /**
+     * 坐标变换：世界坐标 -> 机器人局部坐标
+     * 
+     * R^{-1} = [cos(-θ)  -sin(-θ)]  = [cos(θ)   sin(θ)]
+     *          [sin(-θ)   cos(-θ)]    [-sin(θ)  cos(θ)]
+     * 
+     * p_local = R^{-1} * (p_world - t_robot)
+     */
+    
+    double x = robot_pose(0);
+    double y = robot_pose(1);
+    double theta = robot_pose(2);
+    
+    // 平移
+    Eigen::Vector2d p_translated = point_world - Eigen::Vector2d(x, y);
+    
+    // 旋转（逆变换）
+    double cos_theta = std::cos(theta);
+    double sin_theta = std::sin(theta);
+    
+    Eigen::Matrix2d R_inv;
+    R_inv << cos_theta,  sin_theta,
+            -sin_theta,  cos_theta;
+    
+    return R_inv * p_translated;
+}
+
+double SDFCalculator::computeSweptVolumeSDF(const Eigen::Vector2d& query_point,
+                                          const std::vector<Eigen::Vector4d>& trajectory) const {
+    /**
+     * 扫掠体积SDF计算
+     * 
+     * 算法：对于查询点p，找到最优时间t*：
+     * t* = argmin_{t∈[t_min, t_max]} SDF(p, robot_pose(t))
+     * 
+     * 使用Armijo线搜索优化
+     */
+    
+    if (trajectory.empty()) {
+        return std::numeric_limits<double>::max();
+    }
+    
+    // 使用Armijo线搜索找最优时间
+    double optimal_time = armijoLineSearch(query_point, trajectory);
+    
+    // 在最优时间计算SDF
+    Eigen::Vector3d robot_pose = interpolateTrajectory(trajectory, optimal_time);
+    
+    return computeRobotSDF(query_point, robot_pose);
+}
+
+double SDFCalculator::armijoLineSearch(const Eigen::Vector2d& query_point,
+                                     const std::vector<Eigen::Vector4d>& trajectory) const {
+    /**
+     * Armijo线搜索算法
+     * 
+     * 目标：min_t f(t) = SDF(query_point, robot_pose(t))
+     * 
+     * 参数：
+     * - c1 = 1e-4 (Armijo条件参数)
+     * - alpha = 0.5 (步长缩减因子)
+     * - max_iter = 50 (最大迭代次数)
+     */
+    
+    if (trajectory.size() < 2) {
+        return trajectory[0](3);  // 返回第一个时间点
+    }
+    
+    double t_min = trajectory.front()(3);
+    double t_max = trajectory.back()(3);
+    
+    // 初始猜测：中点
+    double t = (t_min + t_max) / 2.0;
+    double step_size = (t_max - t_min) / 10.0;
+    
+    // Armijo参数
+    const double c1 = 1e-4;
+    const double alpha = 0.5;
+    const int max_iter = 50;
+    
+    double best_t = t;
+    double best_sdf = std::numeric_limits<double>::max();
+    
+    // 网格搜索 + 局部优化
+    for (int i = 0; i < max_iter; ++i) {
+        // 计算当前时间的SDF值
+        Eigen::Vector3d robot_pose = interpolateTrajectory(trajectory, t);
+        double current_sdf = computeRobotSDF(query_point, robot_pose);
+        
+        if (current_sdf < best_sdf) {
+            best_sdf = current_sdf;
+            best_t = t;
+        }
+        
+        // 计算梯度（数值微分）
+        double dt = 1e-6;
+        Eigen::Vector3d pose_plus = interpolateTrajectory(trajectory, t + dt);
+        double sdf_plus = computeRobotSDF(query_point, pose_plus);
+        double gradient = (sdf_plus - current_sdf) / dt;
+        
+        // 梯度下降步骤
+        double new_t = t - step_size * gradient;
+        
+        // 约束在时间范围内
+        new_t = std::max(t_min, std::min(t_max, new_t));
+        
+        // Armijo条件检查
+        Eigen::Vector3d new_pose = interpolateTrajectory(trajectory, new_t);
+        double new_sdf = computeRobotSDF(query_point, new_pose);
+        
+        if (new_sdf <= current_sdf + c1 * step_size * gradient * gradient) {
+            t = new_t;
+        } else {
+            step_size *= alpha;  // 缩减步长
+        }
+        
+        // 收敛检查
+        if (step_size < 1e-8) {
+            break;
+        }
+    }
+    
+    return best_t;
+}
+
+Eigen::Vector3d SDFCalculator::interpolateTrajectory(const std::vector<Eigen::Vector4d>& trajectory,
+                                                   double time) const {
+    /**
+     * 轨迹插值
+     * 
+     * 使用线性插值获取任意时间的机器人位姿
+     */
+    
+    if (trajectory.empty()) {
+        return Eigen::Vector3d::Zero();
+    }
+    
+    if (trajectory.size() == 1) {
+        return trajectory[0].head<3>();
+    }
+    
+    // 边界情况
+    if (time <= trajectory.front()(3)) {
+        return trajectory.front().head<3>();
+    }
+    if (time >= trajectory.back()(3)) {
+        return trajectory.back().head<3>();
+    }
+    
+    // 找到插值区间
+    for (size_t i = 0; i < trajectory.size() - 1; ++i) {
+        double t0 = trajectory[i](3);
+        double t1 = trajectory[i + 1](3);
+        
+        if (time >= t0 && time <= t1) {
+            // 线性插值
+            double alpha = (time - t0) / (t1 - t0);
+            Eigen::Vector3d pose0 = trajectory[i].head<3>();
+            Eigen::Vector3d pose1 = trajectory[i + 1].head<3>();
+            
+            Eigen::Vector3d result;
+            result.head<2>() = (1.0 - alpha) * pose0.head<2>() + alpha * pose1.head<2>();
+            
+            // 角度插值（考虑周期性）
+            double theta0 = pose0(2);
+            double theta1 = pose1(2);
+            double dtheta = theta1 - theta0;
+            
+            // 处理角度跳跃
+            if (dtheta > M_PI) {
+                dtheta -= 2 * M_PI;
+            } else if (dtheta < -M_PI) {
+                dtheta += 2 * M_PI;
+            }
+            
+            result(2) = theta0 + alpha * dtheta;
+            
+            return result;
+        }
+    }
+    
+    // 默认返回最后一个点
+    return trajectory.back().head<3>();
+}
+
+double SDFCalculator::computeSweptVolume(const std::vector<Eigen::Vector4d>& trajectory) const {
+    /**
+     * 扫掠体积计算
+     * 
+     * 使用蒙特卡洛积分估算：
+     * Volume ≈ (Area / N) * ∑ H(-SDF(xi, yi))
+     * 
+     * 其中 H 是Heaviside阶跃函数
+     */
+    
+    if (trajectory.empty()) {
+        return 0.0;
+    }
+    
+    // 计算轨迹边界框
+    double x_min = std::numeric_limits<double>::max();
+    double x_max = std::numeric_limits<double>::lowest();
+    double y_min = std::numeric_limits<double>::max();
+    double y_max = std::numeric_limits<double>::lowest();
+    
+    double margin = std::max(robot_shape_.length, robot_shape_.width) / 2.0 + 0.5;
+    
+    for (const auto& point : trajectory) {
+        x_min = std::min(x_min, point(0) - margin);
+        x_max = std::max(x_max, point(0) + margin);
+        y_min = std::min(y_min, point(1) - margin);
+        y_max = std::max(y_max, point(1) + margin);
+    }
+    
+    // 蒙特卡洛采样
+    const int num_samples = 10000;
+    int inside_count = 0;
+    
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_real_distribution<double> dist_x(x_min, x_max);
+    std::uniform_real_distribution<double> dist_y(y_min, y_max);
+    
+    for (int i = 0; i < num_samples; ++i) {
+        Eigen::Vector2d sample_point(dist_x(gen), dist_y(gen));
+        double sdf = computeSweptVolumeSDF(sample_point, trajectory);
+        
+        if (sdf <= 0.0) {
+            inside_count++;
+        }
+    }
+    
+    // 计算体积
+    double area = (x_max - x_min) * (y_max - y_min);
+    double volume = area * static_cast<double>(inside_count) / num_samples;
+    
+    return volume;
+}
+
+#ifdef USE_CUDA
+// CUDA核函数声明
+extern "C" {
+    void launch_swept_volume_kernel(
+        const float* query_points,
+        const float* trajectory,
+        float* sdf_values,
+        int num_points,
+        int trajectory_size,
+        float robot_length,
+        float robot_width
+    );
+}
+
+bool SDFCalculator::computeSweptVolumeSDF_CUDA(const std::vector<Eigen::Vector2d>& query_points,
+                                              const std::vector<Eigen::Vector4d>& trajectory,
+                                              std::vector<double>& sdf_values) const {
+    if (!use_cuda_ || query_points.empty() || trajectory.empty()) {
+        return false;
+    }
+    
+    // 准备数据
+    std::vector<float> h_points(query_points.size() * 2);
+    std::vector<float> h_trajectory(trajectory.size() * 4);
+    std::vector<float> h_sdf_values(query_points.size());
+    
+    // 复制查询点
+    for (size_t i = 0; i < query_points.size(); ++i) {
+        h_points[i * 2] = static_cast<float>(query_points[i].x());
+        h_points[i * 2 + 1] = static_cast<float>(query_points[i].y());
+    }
+    
+    // 复制轨迹
+    for (size_t i = 0; i < trajectory.size(); ++i) {
+        h_trajectory[i * 4] = static_cast<float>(trajectory[i](0));
+        h_trajectory[i * 4 + 1] = static_cast<float>(trajectory[i](1));
+        h_trajectory[i * 4 + 2] = static_cast<float>(trajectory[i](2));
+        h_trajectory[i * 4 + 3] = static_cast<float>(trajectory[i](3));
+    }
+    
+    // 调用CUDA核函数
+    launch_swept_volume_kernel(
+        h_points.data(),
+        h_trajectory.data(),
+        h_sdf_values.data(),
+        static_cast<int>(query_points.size()),
+        static_cast<int>(trajectory.size()),
+        static_cast<float>(robot_shape_.length),
+        static_cast<float>(robot_shape_.width)
+    );
+    
+    // 同步和错误检查
+    cudaError_t error = cudaDeviceSynchronize();
+    if (error != cudaSuccess) {
+        return false;
+    }
+    
+    // 复制结果
+    sdf_values.resize(query_points.size());
+    for (size_t i = 0; i < query_points.size(); ++i) {
+        sdf_values[i] = static_cast<double>(h_sdf_values[i]);
+    }
+    
+    return true;
+}
+#endif
+
+#endif // SDF_CALCULATOR_H

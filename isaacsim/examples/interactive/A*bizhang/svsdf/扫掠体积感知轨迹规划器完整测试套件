@@ -1,0 +1,625 @@
+/**
+ * @file test_suite.cpp
+ * @brief 扫掠体积感知轨迹规划器完整测试套件
+ * 
+ * 包含单元测试、集成测试、性能测试和回归测试
+ */
+
+#include <gtest/gtest.h>
+#include <gmock/gmock.h>
+#include <chrono>
+#include <random>
+#include <fstream>
+
+#include "sweep_volume_planner.h"
+#include "minco_trajectory.h"
+#include "sdf_calculator.h"
+#include "mpc_controller.h"
+
+using namespace testing;
+using namespace std::chrono;
+
+// ========== 测试基类 ==========
+class PlannerTestBase : public ::testing::Test {
+protected:
+    void SetUp() override {
+        // 标准机器人参数
+        robot_params_.length = 0.6;
+        robot_params_.width = 0.4;
+        robot_params_.max_vel = 1.0;
+        robot_params_.max_omega = 1.5;
+        robot_params_.max_acc = 2.0;
+        robot_params_.wheel_base = 0.3;
+        
+        planner_ = std::make_unique<SweptVolumePlanner>(robot_params_);
+        
+        // 标准测试障碍物
+        test_obstacles_.clear();
+        SweptVolumePlanner::Obstacle obs1;
+        obs1.center = Eigen::Vector2d(2.0, 1.0);
+        obs1.radius = 0.5;
+        test_obstacles_.push_back(obs1);
+        
+        SweptVolumePlanner::Obstacle obs2;
+        obs2.center = Eigen::Vector2d(3.5, 2.0);
+        obs2.radius = 0.3;
+        test_obstacles_.push_back(obs2);
+    }
+    
+    void TearDown() override {
+        planner_.reset();
+    }
+    
+    SweptVolumePlanner::RobotParams robot_params_;
+    std::unique_ptr<SweptVolumePlanner> planner_;
+    std::vector<SweptVolumePlanner::Obstacle> test_obstacles_;
+    
+    // 辅助函数
+    Eigen::VectorXd createState(double x, double y, double theta, 
+                               double vx = 0, double vy = 0, double omega = 0) {
+        Eigen::VectorXd state(6);
+        state << x, y, theta, vx, vy, omega;
+        return state;
+    }
+    
+    bool isTrajectoryValid(const std::vector<SweptVolumePlanner::TrajectoryPoint>& trajectory) {
+        if (trajectory.empty()) return false;
+        
+        // 检查时间单调性
+        for (size_t i = 1; i < trajectory.size(); ++i) {
+            if (trajectory[i].time <= trajectory[i-1].time) {
+                return false;
+            }
+        }
+        
+        // 检查速度和加速度约束
+        for (const auto& point : trajectory) {
+            double linear_vel = point.velocity.head<2>().norm();
+            double angular_vel = std::abs(point.velocity(2));
+            double linear_acc = point.acceleration.head<2>().norm();
+            double angular_acc = std::abs(point.acceleration(2));
+            
+            if (linear_vel > robot_params_.max_vel * 1.1 ||  // 10%容差
+                angular_vel > robot_params_.max_omega * 1.1 ||
+                linear_acc > robot_params_.max_acc * 1.1) {
+                return false;
+            }
+        }
+        
+        return true;
+    }
+};
+
+// ========== MINCO轨迹测试 ==========
+class MINCOTrajectoryTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        minco_traj_ = std::make_unique<MINCOTrajectory>(5);
+        
+        // 创建测试路径点
+        waypoints_.push_back(Eigen::Vector3d(0, 0, 0));
+        waypoints_.push_back(Eigen::Vector3d(1, 1, 0.5));
+        waypoints_.push_back(Eigen::Vector3d(2, 0.5, 0));
+        waypoints_.push_back(Eigen::Vector3d(3, 2, 1.0));
+        waypoints_.push_back(Eigen::Vector3d(4, 1, 0));
+        waypoints_.push_back(Eigen::Vector3d(5, 3, 1.57));
+        
+        initial_times_ = {1.0, 1.2, 0.8, 1.5, 1.0};
+    }
+    
+    std::unique_ptr<MINCOTrajectory> minco_traj_;
+    std::vector<Eigen::Vector3d> waypoints_;
+    std::vector<double> initial_times_;
+};
+
+TEST_F(MINCOTrajectoryTest, InitializationTest) {
+    EXPECT_NO_THROW(minco_traj_->initializeFromWaypoints(waypoints_, initial_times_));
+    
+    // 检查轨迹总时间
+    double total_time = minco_traj_->getTotalTime();
+    double expected_time = 0;
+    for (double t : initial_times_) expected_time += t;
+    
+    EXPECT_NEAR(total_time, expected_time, 1e-6);
+}
+
+TEST_F(MINCOTrajectoryTest, ContinuityTest) {
+    minco_traj_->initializeFromWaypoints(waypoints_, initial_times_);
+    
+    // 测试连续性：在段边界处检查位置、速度、加速度连续性
+    double dt = 1e-6;
+    double current_time = 0;
+    
+    for (size_t seg = 0; seg < initial_times_.size() - 1; ++seg) {
+        current_time += initial_times_[seg];
+        
+        // 段边界前后的状态
+        Eigen::Vector3d pos_before, vel_before, acc_before;
+        Eigen::Vector3d pos_after, vel_after, acc_after;
+        
+        EXPECT_TRUE(minco_traj_->getState(current_time - dt, pos_before, vel_before, acc_before));
+        EXPECT_TRUE(minco_traj_->getState(current_time + dt, pos_after, vel_after, acc_after));
+        
+        // 检查连续性（允许小误差）
+        EXPECT_LT((pos_after - pos_before).norm(), 1e-3);
+        EXPECT_LT((vel_after - vel_before).norm(), 1e-2);
+        EXPECT_LT((acc_after - acc_before).norm(), 1e-1);
+    }
+}
+
+TEST_F(MINCOTrajectoryTest, OptimizationTest) {
+    minco_traj_->initializeFromWaypoints(waypoints_, initial_times_);
+    
+    // 第一阶段优化
+    bool success1 = minco_traj_->optimizeStage1(1.0, 1.0, 1.0, waypoints_);
+    EXPECT_TRUE(success1);
+    
+    // 计算优化前后的能量
+    std::vector<Eigen::Vector3d> positions, velocities, accelerations;
+    std::vector<double> times;
+    minco_traj_->getDiscretizedTrajectory(0.1, positions, velocities, accelerations, times);
+    
+    // 检查轨迹平滑性
+    double total_jerk = 0;
+    for (size_t i = 1; i < accelerations.size(); ++i) {
+        double dt = times[i] - times[i-1];
+        Eigen::Vector3d jerk = (accelerations[i] - accelerations[i-1]) / dt;
+        total_jerk += jerk.squaredNorm();
+    }
+    
+    EXPECT_LT(total_jerk, 1000.0);  // 平滑性阈值
+}
+
+// ========== SDF计算器测试 ==========
+class SDFCalculatorTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        SDFCalculator::RobotShape robot_shape;
+        robot_shape.length = 0.6;
+        robot_shape.width = 0.4;
+        
+        sdf_calc_ = std::make_unique<SDFCalculator>(robot_shape);
+    }
+    
+    std::unique_ptr<SDFCalculator> sdf_calc_;
+};
+
+TEST_F(SDFCalculatorTest, BasicSDFTest) {
+    Eigen::Vector3d robot_pose(0, 0, 0);  // 机器人在原点
+    
+    // 测试不同位置的SDF值
+    
+    // 机器人内部点
+    Eigen::Vector2d inside_point(0, 0);
+    double sdf_inside = sdf_calc_->computeRobotSDF(inside_point, robot_pose);
+    EXPECT_LT(sdf_inside, 0);  // 内部应该是负值
+    
+    // 机器人外部点
+    Eigen::Vector2d outside_point(1, 1);
+    double sdf_outside = sdf_calc_->computeRobotSDF(outside_point, robot_pose);
+    EXPECT_GT(sdf_outside, 0);  // 外部应该是正值
+    
+    // 边界点
+    Eigen::Vector2d boundary_point(0.3, 0);  // 在长边上
+    double sdf_boundary = sdf_calc_->computeRobotSDF(boundary_point, robot_pose);
+    EXPECT_NEAR(sdf_boundary, 0, 1e-6);  // 边界应该接近零
+}
+
+TEST_F(SDFCalculatorTest, RotationInvarianceTest) {
+    Eigen::Vector2d test_point(1, 0);
+    
+    // 测试不同角度的SDF值应该相同
+    std::vector<double> angles = {0, M_PI/4, M_PI/2, M_PI, 3*M_PI/2};
+    std::vector<double> sdf_values;
+    
+    for (double angle : angles) {
+        Eigen::Vector3d robot_pose(0, 0, angle);
+        double sdf = sdf_calc_->computeRobotSDF(test_point, robot_pose);
+        sdf_values.push_back(sdf);
+    }
+    
+    // 检查SDF值的一致性（考虑数值误差）
+    for (size_t i = 1; i < sdf_values.size(); ++i) {
+        EXPECT_NEAR(sdf_values[i], sdf_values[0], 1e-3);
+    }
+}
+
+TEST_F(SDFCalculatorTest, SweptVolumeTest) {
+    // 创建简单的直线轨迹
+    std::vector<Eigen::Vector4d> trajectory;
+    for (int i = 0; i <= 10; ++i) {
+        double t = i * 0.1;
+        trajectory.push_back(Eigen::Vector4d(t, 0, 0, t));  // [x, y, theta, time]
+    }
+    
+    // 测试扫掠体积SDF
+    Eigen::Vector2d query_point(0.5, 0);  // 轨迹路径上的点
+    double swept_sdf = sdf_calc_->computeSweptVolumeSDF(query_point, trajectory);
+    EXPECT_LT(swept_sdf, 0.3);  // 应该在扫掠体积内或附近
+    
+    // 测试远离轨迹的点
+    Eigen::Vector2d far_point(0.5, 5);
+    double far_sdf = sdf_calc_->computeSweptVolumeSDF(far_point, trajectory);
+    EXPECT_GT(far_sdf, 1.0);  // 应该距离较远
+}
+
+// ========== MPC控制器测试 ==========
+class MPCControllerTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        MPCController::MPCParams params;
+        params.prediction_horizon = 10;
+        params.control_horizon = 5;
+        params.sample_time = 0.1;
+        params.wheel_base = 0.3;
+        
+        mpc_controller_ = std::make_unique<MPCController>(params);
+        
+        // 创建参考轨迹
+        createReferenceTrajectory();
+    }
+    
+    void createReferenceTrajectory() {
+        ref_trajectory_.clear();
+        ref_times_.clear();
+        
+        for (int i = 0; i <= 20; ++i) {
+            MPCController::State state;
+            double t = i * 0.1;
+            
+            state.x = t * 0.5;  // 0.5 m/s 前进
+            state.y = 0;
+            state.theta = 0;
+            state.v = 0.5;
+            state.omega = 0;
+            
+            ref_trajectory_.push_back(state);
+            ref_times_.push_back(t);
+        }
+    }
+    
+    std::unique_ptr<MPCController> mpc_controller_;
+    std::vector<MPCController::State> ref_trajectory_;
+    std::vector<double> ref_times_;
+};
+
+TEST_F(MPCControllerTest, BasicControlTest) {
+    MPCController::State current_state;
+    current_state.x = 0;
+    current_state.y = 0;
+    current_state.theta = 0;
+    current_state.v = 0;
+    current_state.omega = 0;
+    
+    MPCController::Control control = mpc_controller_->computeControl(
+        current_state, ref_trajectory_, ref_times_, 0);
+    
+    // 检查控制输出合理性
+    EXPECT_GT(control.linear_vel, 0);  // 应该有前进速度
+    EXPECT_LT(std::abs(control.angular_vel), 0.1);  // 直线运动，角速度应该很小
+    
+    // 检查轮速输出
+    EXPECT_NEAR(control.v_left, control.v_right, 0.1);  // 直线运动时左右轮速度应该相近
+}
+
+TEST_F(MPCControllerTest, ConstraintSatisfactionTest) {
+    MPCController::State current_state;
+    current_state.x = 0; current_state.y = 0; current_state.theta = 0;
+    current_state.v = 0; current_state.omega = 0;
+    
+    // 多次计算控制，检查约束满足
+    for (int i = 0; i < 10; ++i) {
+        MPCController::Control control = mpc_controller_->computeControl(
+            current_state, ref_trajectory_, ref_times_, i * 0.1);
+        
+        // 检查速度约束
+        EXPECT_LE(std::abs(control.linear_vel), 1.0);
+        EXPECT_LE(std::abs(control.angular_vel), 1.5);
+        
+        // 检查轮速约束
+        EXPECT_LE(std::abs(control.v_left), 1.0 + 1.5 * 0.15);  // v + omega * L/2
+        EXPECT_LE(std::abs(control.v_right), 1.0 + 1.5 * 0.15);
+    }
+}
+
+// ========== 集成测试 ==========
+class IntegrationTest : public PlannerTestBase {
+protected:
+    void runPlanningScenario(const std::string& scenario_name,
+                           const Eigen::VectorXd& start,
+                           const Eigen::VectorXd& goal,
+                           const std::vector<SweptVolumePlanner::Obstacle>& obstacles) {
+        
+        auto start_time = high_resolution_clock::now();
+        
+        std::vector<SweptVolumePlanner::TrajectoryPoint> trajectory;
+        bool success = planner_->planTrajectory(start, goal, obstacles, trajectory);
+        
+        auto end_time = high_resolution_clock::now();
+        auto duration = duration_cast<milliseconds>(end_time - start_time);
+        
+        // 记录测试结果
+        TestResult result;
+        result.scenario_name = scenario_name;
+        result.success = success;
+        result.planning_time_ms = duration.count();
+        
+        if (success) {
+            result.trajectory_length = calculateTrajectoryLength(trajectory);
+            result.total_time = trajectory.back().time;
+            result.is_valid = isTrajectoryValid(trajectory);
+        }
+        
+        test_results_.push_back(result);
+        
+        // 断言
+        EXPECT_TRUE(success) << "Planning failed for scenario: " << scenario_name;
+        if (success) {
+            EXPECT_TRUE(isTrajectoryValid(trajectory)) << "Invalid trajectory for: " << scenario_name;
+            EXPECT_LT(duration.count(), 5000) << "Planning too slow for: " << scenario_name; // 5秒限制
+        }
+    }
+    
+    double calculateTrajectoryLength(const std::vector<SweptVolumePlanner::TrajectoryPoint>& trajectory) {
+        if (trajectory.size() < 2) return 0;
+        
+        double length = 0;
+        for (size_t i = 1; i < trajectory.size(); ++i) {
+            Eigen::Vector2d diff = trajectory[i].position.head<2>() - trajectory[i-1].position.head<2>();
+            length += diff.norm();
+        }
+        return length;
+    }
+    
+    struct TestResult {
+        std::string scenario_name;
+        bool success;
+        double planning_time_ms;
+        double trajectory_length;
+        double total_time;
+        bool is_valid;
+    };
+    
+    std::vector<TestResult> test_results_;
+};
+
+TEST_F(IntegrationTest, BasicPlanningTest) {
+    Eigen::VectorXd start = createState(0, 0, 0);
+    Eigen::VectorXd goal = createState(5, 3, M_PI/4);
+    
+    runPlanningScenario("BasicPlanning", start, goal, test_obstacles_);
+}
+
+TEST_F(IntegrationTest, NoObstaclesTest) {
+    Eigen::VectorXd start = createState(0, 0, 0);
+    Eigen::VectorXd goal = createState(3, 2, 0);
+    std::vector<SweptVolumePlanner::Obstacle> no_obstacles;
+    
+    runPlanningScenario("NoObstacles", start, goal, no_obstacles);
+}
+
+TEST_F(IntegrationTest, NarrowPassageTest) {
+    // 创建狭窄通道场景
+    std::vector<SweptVolumePlanner::Obstacle> narrow_obstacles;
+    
+    SweptVolumePlanner::Obstacle wall1, wall2;
+    wall1.center = Eigen::Vector2d(2, 0.6);
+    wall1.radius = 0.2;
+    wall2.center = Eigen::Vector2d(2, 2.4);
+    wall2.radius = 0.2;
+    
+    narrow_obstacles.push_back(wall1);
+    narrow_obstacles.push_back(wall2);
+    
+    Eigen::VectorXd start = createState(0, 1.5, 0);
+    Eigen::VectorXd goal = createState(4, 1.5, 0);
+    
+    runPlanningScenario("NarrowPassage", start, goal, narrow_obstacles);
+}
+
+TEST_F(IntegrationTest, LargeAngleTurnTest) {
+    // 大角度转弯测试（U型转弯）
+    Eigen::VectorXd start = createState(0, 0, 0);
+    Eigen::VectorXd goal = createState(0, 0, M_PI);  // 180度转弯
+    std::vector<SweptVolumePlanner::Obstacle> no_obstacles;
+    
+    runPlanningScenario("LargeAngleTurn", start, goal, no_obstacles);
+}
+
+// ========== 性能测试 ==========
+class PerformanceTest : public PlannerTestBase {
+protected:
+    void SetUp() override {
+        PlannerTestBase::SetUp();
+        
+        // 设置性能测试参数
+        planner_->setOptimizationParams(1.0, 1.0, 10000.0, 1000.0);
+        planner_->setMPCParams(20, 10, 0.1);
+    }
+    
+    struct PerformanceMetrics {
+        double min_time_ms;
+        double max_time_ms;
+        double avg_time_ms;
+        double std_dev_ms;
+        int success_count;
+        int total_runs;
+    };
+    
+    PerformanceMetrics runPerformanceTest(int num_runs) {
+        std::vector<double> times;
+        int success_count = 0;
+        
+        for (int run = 0; run < num_runs; ++run) {
+            auto start_time = high_resolution_clock::now();
+            
+            // 随机生成起点和终点
+            std::random_device rd;
+            std::mt19937 gen(rd());
+            std::uniform_real_distribution<> pos_dist(-2, 7);
+            std::uniform_real_distribution<> angle_dist(-M_PI, M_PI);
+            
+            Eigen::VectorXd start = createState(pos_dist(gen), pos_dist(gen), angle_dist(gen));
+            Eigen::VectorXd goal = createState(pos_dist(gen), pos_dist(gen), angle_dist(gen));
+            
+            std::vector<SweptVolumePlanner::TrajectoryPoint> trajectory;
+            bool success = planner_->planTrajectory(start, goal, test_obstacles_, trajectory);
+            
+            auto end_time = high_resolution_clock::now();
+            auto duration = duration_cast<microseconds>(end_time - start_time);
+            
+            times.push_back(duration.count() / 1000.0);  // 转换为毫秒
+            if (success) success_count++;
+        }
+        
+        PerformanceMetrics metrics;
+        metrics.total_runs = num_runs;
+        metrics.success_count = success_count;
+        
+        if (!times.empty()) {
+            metrics.min_time_ms = *std::min_element(times.begin(), times.end());
+            metrics.max_time_ms = *std::max_element(times.begin(), times.end());
+            
+            double sum = std::accumulate(times.begin(), times.end(), 0.0);
+            metrics.avg_time_ms = sum / times.size();
+            
+            double sq_sum = std::inner_product(times.begin(), times.end(), times.begin(), 0.0);
+            metrics.std_dev_ms = std::sqrt(sq_sum / times.size() - metrics.avg_time_ms * metrics.avg_time_ms);
+        }
+        
+        return metrics;
+    }
+};
+
+TEST_F(PerformanceTest, PlanningTimeTest) {
+    const int num_runs = 50;
+    PerformanceMetrics metrics = runPerformanceTest(num_runs);
+    
+    // 性能断言
+    EXPECT_GT(metrics.success_count, num_runs * 0.8);  // 至少80%成功率
+    EXPECT_LT(metrics.avg_time_ms, 2000);  // 平均时间小于2秒
+    EXPECT_LT(metrics.max_time_ms, 5000);  // 最大时间小于5秒
+    
+    // 输出性能报告
+    std::cout << "\n=== 性能测试报告 ===\n";
+    std::cout << "总运行次数: " << metrics.total_runs << "\n";
+    std::cout << "成功次数: " << metrics.success_count << "\n";
+    std::cout << "成功率: " << (100.0 * metrics.success_count / metrics.total_runs) << "%\n";
+    std::cout << "最小时间: " << metrics.min_time_ms << " ms\n";
+    std::cout << "最大时间: " << metrics.max_time_ms << " ms\n";
+    std::cout << "平均时间: " << metrics.avg_time_ms << " ms\n";
+    std::cout << "标准差: " << metrics.std_dev_ms << " ms\n";
+}
+
+TEST_F(PerformanceTest, MPCComputationTimeTest) {
+    // 创建一个测试轨迹
+    std::vector<SweptVolumePlanner::TrajectoryPoint> trajectory;
+    for (int i = 0; i <= 50; ++i) {
+        SweptVolumePlanner::TrajectoryPoint point;
+        point.position = Eigen::Vector3d(i * 0.1, 0, 0);
+        point.velocity = Eigen::Vector3d(0.5, 0, 0);
+        point.acceleration = Eigen::Vector3d::Zero();
+        point.time = i * 0.1;
+        trajectory.push_back(point);
+    }
+    
+    const int num_mpc_runs = 100;
+    std::vector<double> mpc_times;
+    
+    for (int run = 0; run < num_mpc_runs; ++run) {
+        Eigen::VectorXd current_state = createState(run * 0.05, 0, 0, 0.5, 0, 0);
+        
+        auto start_time = high_resolution_clock::now();
+        auto control = planner_->computeMPCControl(current_state, trajectory, run * 0.1);
+        auto end_time = high_resolution_clock::now();
+        
+        auto duration = duration_cast<microseconds>(end_time - start_time);
+        mpc_times.push_back(duration.count() / 1000.0);  // 转换为毫秒
+    }
+    
+    double avg_mpc_time = std::accumulate(mpc_times.begin(), mpc_times.end(), 0.0) / mpc_times.size();
+    double max_mpc_time = *std::max_element(mpc_times.begin(), mpc_times.end());
+    
+    // MPC应该非常快
+    EXPECT_LT(avg_mpc_time, 10);   // 平均小于10ms
+    EXPECT_LT(max_mpc_time, 50);   // 最大小于50ms
+    
+    std::cout << "\n=== MPC性能测试 ===\n";
+    std::cout << "平均计算时间: " << avg_mpc_time << " ms\n";
+    std::cout << "最大计算时间: " << max_mpc_time << " ms\n";
+}
+
+// ========== 回归测试 ==========
+class RegressionTest : public PlannerTestBase {
+protected:
+    struct RegressionData {
+        std::string scenario_name;
+        Eigen::VectorXd start_state;
+        Eigen::VectorXd goal_state;
+        std::vector<SweptVolumePlanner::Obstacle> obstacles;
+        double expected_time;
+        double expected_length;
+        double tolerance;
+    };
+    
+    void SetUp() override {
+        PlannerTestBase::SetUp();
+        loadRegressionData();
+    }
+    
+    void loadRegressionData() {
+        // 预定义的回归测试用例
+        RegressionData case1;
+        case1.scenario_name = "StandardCase1";
+        case1.start_state = createState(0, 0, 0);
+        case1.goal_state = createState(3, 2, M_PI/2);
+        case1.obstacles = test_obstacles_;
+        case1.expected_time = 4.5;      // 预期时间
+        case1.expected_length = 4.2;    // 预期路径长度
+        case1.tolerance = 0.5;          // 容差
+        
+        regression_cases_.push_back(case1);
+        
+        // 更多测试用例...
+    }
+    
+    std::vector<RegressionData> regression_cases_;
+};
+
+TEST_F(RegressionTest, StandardRegressionCases) {
+    for (const auto& test_case : regression_cases_) {
+        std::vector<SweptVolumePlanner::TrajectoryPoint> trajectory;
+        bool success = planner_->planTrajectory(
+            test_case.start_state, test_case.goal_state, test_case.obstacles, trajectory);
+        
+        ASSERT_TRUE(success) << "Regression test failed for: " << test_case.scenario_name;
+        
+        // 检查时间和长度是否在预期范围内
+        double actual_time = trajectory.back().time;
+        double actual_length = 0;
+        for (size_t i = 1; i < trajectory.size(); ++i) {
+            actual_length += (trajectory[i].position.head<2>() - 
+                            trajectory[i-1].position.head<2>()).norm();
+        }
+        
+        EXPECT_NEAR(actual_time, test_case.expected_time, test_case.tolerance)
+            << "Time regression for: " << test_case.scenario_name;
+        EXPECT_NEAR(actual_length, test_case.expected_length, test_case.tolerance)
+            << "Length regression for: " << test_case.scenario_name;
+    }
+}
+
+// ========== 主测试运行器 ==========
+int main(int argc, char** argv) {
+    ::testing::InitGoogleTest(&argc, argv);
+    
+    // 设置测试环境
+    std::cout << "开始扫掠体积感知轨迹规划器测试套件\n";
+    std::cout << "===========================================\n";
+    
+    // 运行所有测试
+    int result = RUN_ALL_TESTS();
+    
+    std::cout << "\n测试完成！\n";
+    return result;
+}

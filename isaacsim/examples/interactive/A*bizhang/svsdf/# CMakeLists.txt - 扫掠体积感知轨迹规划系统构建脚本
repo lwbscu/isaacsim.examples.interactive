@@ -1,0 +1,375 @@
+# CMakeLists.txt - 扫掠体积感知轨迹规划系统构建脚本
+cmake_minimum_required(VERSION 3.16)
+project(SweptVolumePlanner VERSION 1.0.0 LANGUAGES CXX)
+
+# C++标准设置
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# 编译选项
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra -O3 -march=native")
+set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -g -O0 -DDEBUG")
+set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O3 -DNDEBUG")
+
+# 构建类型
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release)
+endif()
+
+message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
+
+# 选项配置
+option(USE_CUDA "Enable CUDA acceleration" ON)
+option(USE_OPENMP "Enable OpenMP parallelization" ON)
+option(BUILD_TESTS "Build test executables" ON)
+option(BUILD_EXAMPLES "Build example programs" ON)
+option(BUILD_PYTHON_BINDINGS "Build Python bindings" OFF)
+
+# 查找依赖库
+find_package(Eigen3 3.3 REQUIRED NO_MODULE)
+message(STATUS "Found Eigen3: ${Eigen3_VERSION}")
+
+# OpenMP支持
+if(USE_OPENMP)
+    find_package(OpenMP REQUIRED)
+    if(OpenMP_CXX_FOUND)
+        message(STATUS "OpenMP found: ${OpenMP_CXX_VERSION}")
+    endif()
+endif()
+
+# CUDA支持
+if(USE_CUDA)
+    enable_language(CUDA)
+    find_package(CUDAToolkit REQUIRED)
+    
+    if(CUDAToolkit_FOUND)
+        message(STATUS "CUDA found: ${CUDAToolkit_VERSION}")
+        set(CMAKE_CUDA_STANDARD 17)
+        set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+        set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -O3 --expt-extended-lambda")
+        
+        # CUDA架构设置
+        if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+            set(CMAKE_CUDA_ARCHITECTURES 75 80 86)  # 支持RTX 20xx, 30xx, 40xx
+        endif()
+        message(STATUS "CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES}")
+    endif()
+endif()
+
+# 头文件目录
+include_directories(
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+
+# 源文件列表
+set(CORE_SOURCES
+    src/sweep_volume_planner.cpp
+    src/minco_trajectory.cpp
+    src/sdf_calculator.cpp
+    src/mpc_controller.cpp
+    src/a_star_planner.cpp
+    src/lbfgs_optimizer.cpp
+)
+
+set(CORE_HEADERS
+    include/sweep_volume_planner.h
+    include/minco_trajectory.h
+    include/sdf_calculator.h
+    include/mpc_controller.h
+    include/a_star_planner.h
+    include/lbfgs_optimizer.h
+    include/common_types.h
+)
+
+# CUDA源文件
+if(USE_CUDA)
+    set(CUDA_SOURCES
+        src/cuda_kernels.cu
+        src/cuda_sdf_calculator.cu
+    )
+endif()
+
+# 创建核心库
+if(USE_CUDA)
+    add_library(swept_volume_planner_core STATIC
+        ${CORE_SOURCES}
+        ${CORE_HEADERS}
+        ${CUDA_SOURCES}
+    )
+    
+    # CUDA编译属性
+    set_target_properties(swept_volume_planner_core PROPERTIES
+        CUDA_SEPARABLE_COMPILATION ON
+        CUDA_RESOLVE_DEVICE_SYMBOLS ON
+    )
+    
+    target_link_libraries(swept_volume_planner_core 
+        CUDA::cudart
+        CUDA::curand
+    )
+    
+    target_compile_definitions(swept_volume_planner_core PUBLIC USE_CUDA)
+else()
+    add_library(swept_volume_planner_core STATIC
+        ${CORE_SOURCES}
+        ${CORE_HEADERS}
+    )
+endif()
+
+# 链接依赖库
+target_link_libraries(swept_volume_planner_core 
+    Eigen3::Eigen
+)
+
+if(USE_OPENMP AND OpenMP_CXX_FOUND)
+    target_link_libraries(swept_volume_planner_core OpenMP::OpenMP_CXX)
+    target_compile_definitions(swept_volume_planner_core PUBLIC USE_OPENMP)
+endif()
+
+# 编译定义
+target_compile_definitions(swept_volume_planner_core PUBLIC
+    PROJECT_VERSION="${PROJECT_VERSION}"
+)
+
+# 主可执行文件
+add_executable(swept_volume_planner_demo
+    examples/main_demo.cpp
+)
+
+target_link_libraries(swept_volume_planner_demo
+    swept_volume_planner_core
+)
+
+# 性能基准测试
+add_executable(performance_benchmark
+    examples/performance_benchmark.cpp
+)
+
+target_link_libraries(performance_benchmark
+    swept_volume_planner_core
+)
+
+# 单元测试
+if(BUILD_TESTS)
+    # 查找Google Test
+    find_package(GTest QUIET)
+    
+    if(GTest_FOUND)
+        message(STATUS "Google Test found, building tests")
+        
+        enable_testing()
+        
+        set(TEST_SOURCES
+            tests/test_minco_trajectory.cpp
+            tests/test_sdf_calculator.cpp
+            tests/test_mpc_controller.cpp
+            tests/test_integration.cpp
+            tests/test_performance.cpp
+        )
+        
+        add_executable(unit_tests ${TEST_SOURCES})
+        
+        target_link_libraries(unit_tests
+            swept_volume_planner_core
+            GTest::gtest
+            GTest::gtest_main
+        )
+        
+        include(GoogleTest)
+        gtest_discover_tests(unit_tests)
+    else()
+        message(WARNING "Google Test not found, skipping test build")
+    endif()
+endif()
+
+# Python绑定
+if(BUILD_PYTHON_BINDINGS)
+    find_package(pybind11 QUIET)
+    
+    if(pybind11_FOUND)
+        message(STATUS "pybind11 found, building Python bindings")
+        
+        pybind11_add_module(pysweptplanner
+            python/python_bindings.cpp
+        )
+        
+        target_link_libraries(pysweptplanner PRIVATE
+            swept_volume_planner_core
+        )
+        
+        target_compile_definitions(pysweptplanner PRIVATE
+            VERSION_INFO="${PROJECT_VERSION}"
+        )
+    else()
+        message(WARNING "pybind11 not found, skipping Python bindings")
+    endif()
+endif()
+
+# 示例程序
+if(BUILD_EXAMPLES)
+    # 基础示例
+    add_executable(basic_example
+        examples/basic_example.cpp
+    )
+    target_link_libraries(basic_example swept_volume_planner_core)
+    
+    # 多场景测试
+    add_executable(multi_scenario_test
+        examples/multi_scenario_test.cpp
+    )
+    target_link_libraries(multi_scenario_test swept_volume_planner_core)
+    
+    # ROS节点（如果找到ROS）
+    find_package(roscpp QUIET)
+    find_package(geometry_msgs QUIET)
+    find_package(nav_msgs QUIET)
+    
+    if(roscpp_FOUND AND geometry_msgs_FOUND AND nav_msgs_FOUND)
+        message(STATUS "ROS found, building ROS node")
+        
+        add_executable(ros_planner_node
+            ros/ros_planner_node.cpp
+            ros/ros_interface.cpp
+        )
+        
+        target_link_libraries(ros_planner_node
+            swept_volume_planner_core
+            ${roscpp_LIBRARIES}
+            ${geometry_msgs_LIBRARIES}
+            ${nav_msgs_LIBRARIES}
+        )
+        
+        target_include_directories(ros_planner_node PRIVATE
+            ${roscpp_INCLUDE_DIRS}
+            ${geometry_msgs_INCLUDE_DIRS}
+            ${nav_msgs_INCLUDE_DIRS}
+        )
+    endif()
+endif()
+
+# 安装规则
+install(TARGETS swept_volume_planner_core
+    EXPORT SweptVolumePlannerTargets
+    LIBRARY DESTINATION lib
+    ARCHIVE DESTINATION lib
+    RUNTIME DESTINATION bin
+    INCLUDES DESTINATION include
+)
+
+install(FILES ${CORE_HEADERS}
+    DESTINATION include/swept_volume_planner
+)
+
+install(TARGETS swept_volume_planner_demo
+    RUNTIME DESTINATION bin
+)
+
+# 配置文件安装
+install(FILES
+    config/default_params.yaml
+    config/robot_models.yaml
+    DESTINATION share/swept_volume_planner/config
+)
+
+# 脚本安装
+install(PROGRAMS
+    scripts/visualize_trajectory.py
+    scripts/run_benchmark.sh
+    DESTINATION share/swept_volume_planner/scripts
+)
+
+# 导出配置
+install(EXPORT SweptVolumePlannerTargets
+    FILE SweptVolumePlannerTargets.cmake
+    NAMESPACE SweptVolumePlanner::
+    DESTINATION lib/cmake/SweptVolumePlanner
+)
+
+# 版本配置
+include(CMakePackageConfigHelpers)
+
+configure_package_config_file(
+    cmake/SweptVolumePlannerConfig.cmake.in
+    ${CMAKE_CURRENT_BINARY_DIR}/SweptVolumePlannerConfig.cmake
+    INSTALL_DESTINATION lib/cmake/SweptVolumePlanner
+)
+
+write_basic_package_version_file(
+    ${CMAKE_CURRENT_BINARY_DIR}/SweptVolumePlannerConfigVersion.cmake
+    VERSION ${PROJECT_VERSION}
+    COMPATIBILITY AnyNewerVersion
+)
+
+install(FILES
+    ${CMAKE_CURRENT_BINARY_DIR}/SweptVolumePlannerConfig.cmake
+    ${CMAKE_CURRENT_BINARY_DIR}/SweptVolumePlannerConfigVersion.cmake
+    DESTINATION lib/cmake/SweptVolumePlanner
+)
+
+# 文档生成（Doxygen）
+find_package(Doxygen QUIET)
+if(Doxygen_FOUND)
+    message(STATUS "Doxygen found, documentation target available")
+    
+    set(DOXYGEN_IN ${CMAKE_CURRENT_SOURCE_DIR}/docs/Doxyfile.in)
+    set(DOXYGEN_OUT ${CMAKE_CURRENT_BINARY_DIR}/Doxyfile)
+    
+    configure_file(${DOXYGEN_IN} ${DOXYGEN_OUT} @ONLY)
+    
+    add_custom_target(docs ALL
+        COMMAND ${DOXYGEN_EXECUTABLE} ${DOXYGEN_OUT}
+        WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+        COMMENT "Generating API documentation with Doxygen"
+        VERBATIM
+    )
+    
+    install(DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/html/
+        DESTINATION share/doc/swept_volume_planner
+        OPTIONAL
+    )
+endif()
+
+# 包配置
+set(CPACK_PACKAGE_NAME "SweptVolumePlanner")
+set(CPACK_PACKAGE_VERSION ${PROJECT_VERSION})
+set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "Swept Volume-Aware Trajectory Planning for Mobile Robots")
+set(CPACK_PACKAGE_VENDOR "Your Organization")
+set(CPACK_PACKAGE_CONTACT "your.email@example.com")
+
+set(CPACK_SOURCE_GENERATOR "TGZ")
+set(CPACK_GENERATOR "TGZ;DEB")
+
+set(CPACK_DEBIAN_PACKAGE_DEPENDS "libeigen3-dev")
+if(USE_CUDA)
+    set(CPACK_DEBIAN_PACKAGE_DEPENDS "${CPACK_DEBIAN_PACKAGE_DEPENDS}, nvidia-cuda-toolkit")
+endif()
+
+include(CPack)
+
+# 信息输出
+message(STATUS "=== SweptVolumePlanner Configuration ===")
+message(STATUS "Version: ${PROJECT_VERSION}")
+message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
+message(STATUS "C++ standard: ${CMAKE_CXX_STANDARD}")
+message(STATUS "CUDA support: ${USE_CUDA}")
+message(STATUS "OpenMP support: ${USE_OPENMP}")
+message(STATUS "Build tests: ${BUILD_TESTS}")
+message(STATUS "Build examples: ${BUILD_EXAMPLES}")
+message(STATUS "Python bindings: ${BUILD_PYTHON_BINDINGS}")
+message(STATUS "Install prefix: ${CMAKE_INSTALL_PREFIX}")
+message(STATUS "=======================================")
+
+# 自定义目标
+add_custom_target(format
+    COMMAND clang-format -i ${CORE_SOURCES} ${CORE_HEADERS}
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    COMMENT "Formatting source code"
+)
+
+add_custom_target(clean-all
+    COMMAND ${CMAKE_BUILD_TOOL} clean
+    COMMAND ${CMAKE_COMMAND} -E remove_directory ${CMAKE_BINARY_DIR}/CMakeCache.txt
+    COMMAND ${CMAKE_COMMAND} -E remove_directory ${CMAKE_BINARY_DIR}/CMakeFiles
+    COMMENT "Cleaning all build files"
+)

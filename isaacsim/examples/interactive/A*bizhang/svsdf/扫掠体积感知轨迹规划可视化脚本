@@ -1,0 +1,503 @@
+#!/usr/bin/env python3
+"""
+扫掠体积感知轨迹规划可视化脚本
+
+功能：
+1. 显示规划的轨迹
+2. 可视化扫掠体积
+3. 显示障碍物和安全区域
+4. MPC跟踪控制效果
+5. 性能指标分析
+"""
+
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+from matplotlib.animation import FuncAnimation
+import pandas as pd
+import argparse
+from matplotlib.collections import PatchCollection
+
+class TrajectoryVisualizer:
+    def __init__(self):
+        self.fig, self.axes = plt.subplots(2, 2, figsize=(15, 12))
+        self.fig.suptitle('扫掠体积感知轨迹规划结果', fontsize=16, fontweight='bold')
+        
+        # 机器人参数
+        self.robot_length = 0.6
+        self.robot_width = 0.4
+        
+        # 障碍物
+        self.obstacles = [
+            {'center': [2.0, 1.0], 'radius': 0.5},
+            {'center': [3.5, 2.0], 'radius': 0.3}
+        ]
+        
+        # 颜色设置
+        self.colors = {
+            'trajectory': '#2E86AB',
+            'mpc_path': '#A23B72', 
+            'robot': '#F18F01',
+            'swept_volume': '#C73E1D',
+            'obstacle': '#845EC2',
+            'safe_zone': '#4E8397'
+        }
+        
+    def load_data(self, trajectory_file='trajectory_result.csv', control_file='mpc_control.csv'):
+        """加载轨迹和控制数据"""
+        try:
+            self.trajectory_data = pd.read_csv(trajectory_file)
+            print(f"加载轨迹数据: {len(self.trajectory_data)} 个点")
+        except FileNotFoundError:
+            print(f"警告: 未找到轨迹文件 {trajectory_file}")
+            self.trajectory_data = None
+            
+        try:
+            self.control_data = pd.read_csv(control_file)
+            print(f"加载控制数据: {len(self.control_data)} 个点")
+        except FileNotFoundError:
+            print(f"警告: 未找到控制文件 {control_file}")
+            self.control_data = None
+    
+    def plot_trajectory_overview(self):
+        """绘制轨迹总览"""
+        ax = self.axes[0, 0]
+        ax.set_title('轨迹规划总览', fontsize=14, fontweight='bold')
+        
+        if self.trajectory_data is not None:
+            # 绘制规划轨迹
+            x = self.trajectory_data['x'].values
+            y = self.trajectory_data['y'].values
+            
+            # 轨迹线
+            ax.plot(x, y, color=self.colors['trajectory'], linewidth=3, 
+                   label='规划轨迹', alpha=0.8)
+            
+            # 起点和终点
+            ax.plot(x[0], y[0], 'go', markersize=12, label='起点', markeredgecolor='black')
+            ax.plot(x[-1], y[-1], 'rs', markersize=12, label='终点', markeredgecolor='black')
+            
+            # 绘制轨迹方向箭头
+            self.draw_trajectory_arrows(ax, x, y, self.trajectory_data['theta'].values)
+            
+        # MPC跟踪路径
+        if self.control_data is not None:
+            x_mpc = self.control_data['x'].values
+            y_mpc = self.control_data['y'].values
+            ax.plot(x_mpc, y_mpc, '--', color=self.colors['mpc_path'], 
+                   linewidth=2, label='MPC跟踪', alpha=0.7)
+        
+        # 绘制障碍物
+        self.draw_obstacles(ax)
+        
+        ax.set_xlabel('X (m)')
+        ax.set_ylabel('Y (m)')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        ax.set_aspect('equal')
+    
+    def plot_swept_volume_analysis(self):
+        """绘制扫掠体积分析"""
+        ax = self.axes[0, 1]
+        ax.set_title('扫掠体积可视化', fontsize=14, fontweight='bold')
+        
+        if self.trajectory_data is not None:
+            x = self.trajectory_data['x'].values
+            y = self.trajectory_data['y'].values
+            theta = self.trajectory_data['theta'].values
+            
+            # 绘制扫掠体积
+            self.draw_swept_volume(ax, x, y, theta)
+            
+            # 绘制机器人在关键位置的姿态
+            key_indices = np.linspace(0, len(x)-1, 8).astype(int)
+            for i in key_indices:
+                self.draw_robot(ax, x[i], y[i], theta[i], alpha=0.6)
+        
+        # 绘制障碍物
+        self.draw_obstacles(ax)
+        
+        ax.set_xlabel('X (m)')
+        ax.set_ylabel('Y (m)')
+        ax.grid(True, alpha=0.3)
+        ax.set_aspect('equal')
+    
+    def plot_velocity_profiles(self):
+        """绘制速度曲线"""
+        ax = self.axes[1, 0]
+        ax.set_title('速度曲线', fontsize=14, fontweight='bold')
+        
+        if self.trajectory_data is not None:
+            time = self.trajectory_data['time'].values
+            
+            # 线速度和角速度
+            linear_vel = np.sqrt(self.trajectory_data['vx']**2 + self.trajectory_data['vy']**2)
+            angular_vel = self.trajectory_data['omega'].values
+            
+            ax.plot(time, linear_vel, color=self.colors['trajectory'], 
+                   linewidth=2, label='线速度 (m/s)')
+            ax.plot(time, angular_vel, color=self.colors['swept_volume'], 
+                   linewidth=2, label='角速度 (rad/s)')
+            
+            # 速度限制线
+            ax.axhline(y=1.0, color='gray', linestyle='--', alpha=0.7, label='速度限制')
+            ax.axhline(y=-1.0, color='gray', linestyle='--', alpha=0.7)
+            ax.axhline(y=1.5, color='orange', linestyle='--', alpha=0.7, label='角速度限制')
+            ax.axhline(y=-1.5, color='orange', linestyle='--', alpha=0.7)
+        
+        if self.control_data is not None:
+            time_mpc = self.control_data['time'].values
+            v_linear = self.control_data['v_linear'].values
+            v_angular = self.control_data['v_angular'].values
+            
+            ax.plot(time_mpc, v_linear, '--', color=self.colors['mpc_path'], 
+                   linewidth=2, label='MPC线速度', alpha=0.8)
+            ax.plot(time_mpc, v_angular, '--', color='purple', 
+                   linewidth=2, label='MPC角速度', alpha=0.8)
+        
+        ax.set_xlabel('时间 (s)')
+        ax.set_ylabel('速度')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+    
+    def plot_performance_metrics(self):
+        """绘制性能指标"""
+        ax = self.axes[1, 1]
+        ax.set_title('性能分析', fontsize=14, fontweight='bold')
+        
+        if self.trajectory_data is not None and self.control_data is not None:
+            # 计算跟踪误差
+            time_traj = self.trajectory_data['time'].values
+            time_mpc = self.control_data['time'].values
+            
+            # 插值获得相同时间点的参考轨迹
+            x_ref_interp = np.interp(time_mpc, time_traj, self.trajectory_data['x'])
+            y_ref_interp = np.interp(time_mpc, time_traj, self.trajectory_data['y'])
+            
+            # 计算位置误差
+            x_error = self.control_data['x'].values - x_ref_interp
+            y_error = self.control_data['y'].values - y_ref_interp
+            position_error = np.sqrt(x_error**2 + y_error**2)
+            
+            # 绘制误差曲线
+            ax.plot(time_mpc, position_error * 100, color=self.colors['swept_volume'], 
+                   linewidth=2, label='位置误差 (cm)')
+            
+            ax.plot(time_mpc, np.abs(x_error) * 100, '--', 
+                   color=self.colors['trajectory'], alpha=0.7, label='X误差 (cm)')
+            ax.plot(time_mpc, np.abs(y_error) * 100, '--', 
+                   color=self.colors['mpc_path'], alpha=0.7, label='Y误差 (cm)')
+            
+            # 统计信息
+            mean_error = np.mean(position_error) * 100
+            max_error = np.max(position_error) * 100
+            
+            ax.text(0.02, 0.98, f'平均误差: {mean_error:.2f} cm\n最大误差: {max_error:.2f} cm', 
+                   transform=ax.transAxes, verticalalignment='top',
+                   bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+        
+        # 添加性能指标
+        if hasattr(self, 'trajectory_data') and self.trajectory_data is not None:
+            total_time = self.trajectory_data['time'].iloc[-1]
+            total_distance = self.calculate_path_length()
+            
+            # 计算扫掠体积（简化估算）
+            swept_area = self.estimate_swept_area()
+            
+            metrics_text = f'总时间: {total_time:.2f} s\n'
+            metrics_text += f'路径长度: {total_distance:.2f} m\n'
+            metrics_text += f'平均速度: {total_distance/total_time:.2f} m/s\n'
+            metrics_text += f'扫掠面积: {swept_area:.2f} m²'
+            
+            ax.text(0.98, 0.02, metrics_text, transform=ax.transAxes, 
+                   horizontalalignment='right', verticalalignment='bottom',
+                   bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.8))
+        
+        ax.set_xlabel('时间 (s)')
+        ax.set_ylabel('误差 (cm)')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+    
+    def draw_robot(self, ax, x, y, theta, alpha=1.0):
+        """绘制机器人"""
+        # 机器人矩形
+        robot_rect = patches.Rectangle(
+            (-self.robot_length/2, -self.robot_width/2),
+            self.robot_length, self.robot_width,
+            angle=np.degrees(theta), facecolor=self.colors['robot'], 
+            alpha=alpha, edgecolor='black', linewidth=1
+        )
+        
+        # 变换到世界坐标
+        t = plt.matplotlib.transforms.Affine2D().rotate_around(0, 0, theta).translate(x, y) + ax.transData
+        robot_rect.set_transform(t)
+        ax.add_patch(robot_rect)
+        
+        # 绘制方向箭头
+        arrow_length = self.robot_length * 0.6
+        dx = arrow_length * np.cos(theta)
+        dy = arrow_length * np.sin(theta)
+        ax.arrow(x, y, dx, dy, head_width=0.05, head_length=0.05, 
+                fc='red', ec='red', alpha=alpha)
+    
+    def draw_obstacles(self, ax):
+        """绘制障碍物"""
+        for obs in self.obstacles:
+            # 障碍物圆形
+            circle = patches.Circle(obs['center'], obs['radius'], 
+                                  facecolor=self.colors['obstacle'], 
+                                  alpha=0.7, edgecolor='black')
+            ax.add_patch(circle)
+            
+            # 安全区域
+            safety_margin = obs['radius'] + max(self.robot_length, self.robot_width) / 2 + 0.1
+            safety_circle = patches.Circle(obs['center'], safety_margin,
+                                         facecolor='none', edgecolor=self.colors['safe_zone'],
+                                         linestyle='--', alpha=0.5)
+            ax.add_patch(safety_circle)
+    
+    def draw_swept_volume(self, ax, x, y, theta):
+        """绘制扫掠体积"""
+        # 简化的扫掠体积可视化：显示机器人在每个时间点的轮廓
+        patches_list = []
+        
+        for i in range(0, len(x), max(1, len(x)//20)):  # 采样20个位置
+            # 计算机器人四个角点
+            corners = self.get_robot_corners(x[i], y[i], theta[i])
+            
+            # 创建多边形
+            polygon = patches.Polygon(corners, closed=True, 
+                                    facecolor=self.colors['swept_volume'], 
+                                    alpha=0.1, edgecolor='none')
+            patches_list.append(polygon)
+        
+        # 添加所有补丁
+        collection = PatchCollection(patches_list, match_original=True)
+        ax.add_collection(collection)
+        
+        # 绘制扫掠边界
+        boundary_x, boundary_y = self.calculate_swept_boundary(x, y, theta)
+        ax.fill(boundary_x, boundary_y, color=self.colors['swept_volume'], 
+               alpha=0.2, label='扫掠体积')
+    
+    def get_robot_corners(self, x, y, theta):
+        """获取机器人四个角点坐标"""
+        # 机器人局部坐标系中的四个角点
+        local_corners = np.array([
+            [-self.robot_length/2, -self.robot_width/2],
+            [self.robot_length/2, -self.robot_width/2],
+            [self.robot_length/2, self.robot_width/2],
+            [-self.robot_length/2, self.robot_width/2]
+        ])
+        
+        # 旋转矩阵
+        R = np.array([[np.cos(theta), -np.sin(theta)],
+                     [np.sin(theta), np.cos(theta)]])
+        
+        # 转换到世界坐标系
+        world_corners = (R @ local_corners.T).T + np.array([x, y])
+        
+        return world_corners
+    
+    def calculate_swept_boundary(self, x, y, theta):
+        """计算扫掠体积边界"""
+        all_corners = []
+        
+        for i in range(len(x)):
+            corners = self.get_robot_corners(x[i], y[i], theta[i])
+            all_corners.extend(corners)
+        
+        all_corners = np.array(all_corners)
+        
+        # 计算凸包
+        from scipy.spatial import ConvexHull
+        if len(all_corners) > 3:
+            hull = ConvexHull(all_corners)
+            boundary_points = all_corners[hull.vertices]
+            
+            # 闭合轮廓
+            boundary_x = np.append(boundary_points[:, 0], boundary_points[0, 0])
+            boundary_y = np.append(boundary_points[:, 1], boundary_points[0, 1])
+        else:
+            boundary_x, boundary_y = [], []
+        
+        return boundary_x, boundary_y
+    
+    def draw_trajectory_arrows(self, ax, x, y, theta):
+        """绘制轨迹方向箭头"""
+        # 每隔几个点绘制一个箭头
+        step = max(1, len(x) // 15)
+        for i in range(0, len(x), step):
+            dx = 0.15 * np.cos(theta[i])
+            dy = 0.15 * np.sin(theta[i])
+            ax.arrow(x[i], y[i], dx, dy, head_width=0.08, head_length=0.06,
+                    fc=self.colors['trajectory'], ec=self.colors['trajectory'], 
+                    alpha=0.7, width=0.01)
+    
+    def calculate_path_length(self):
+        """计算路径长度"""
+        if self.trajectory_data is None:
+            return 0.0
+        
+        x = self.trajectory_data['x'].values
+        y = self.trajectory_data['y'].values
+        
+        total_length = 0.0
+        for i in range(1, len(x)):
+            dx = x[i] - x[i-1]
+            dy = y[i] - y[i-1]
+            total_length += np.sqrt(dx**2 + dy**2)
+        
+        return total_length
+    
+    def estimate_swept_area(self):
+        """估算扫掠面积"""
+        if self.trajectory_data is None:
+            return 0.0
+        
+        x = self.trajectory_data['x'].values
+        y = self.trajectory_data['y'].values
+        theta = self.trajectory_data['theta'].values
+        
+        # 简化估算：机器人面积 × 路径长度系数
+        robot_area = self.robot_length * self.robot_width
+        path_length = self.calculate_path_length()
+        
+        # 考虑转弯时的额外扫掠
+        turning_factor = 1.0
+        for i in range(1, len(theta)):
+            angle_change = abs(theta[i] - theta[i-1])
+            turning_factor += angle_change * 0.1  # 转弯惩罚
+        
+        return robot_area + path_length * self.robot_width * turning_factor * 0.1
+    
+    def create_animation(self):
+        """创建动画演示"""
+        if self.control_data is None:
+            print("无MPC控制数据，跳过动画")
+            return
+        
+        fig_anim, ax_anim = plt.subplots(figsize=(10, 8))
+        ax_anim.set_title('MPC轨迹跟踪动画演示', fontsize=14, fontweight='bold')
+        
+        # 绘制静态元素
+        if self.trajectory_data is not None:
+            x_ref = self.trajectory_data['x'].values
+            y_ref = self.trajectory_data['y'].values
+            ax_anim.plot(x_ref, y_ref, color=self.colors['trajectory'], 
+                        linewidth=2, alpha=0.5, label='参考轨迹')
+        
+        self.draw_obstacles(ax_anim)
+        
+        # 动态元素初始化
+        robot_patch = patches.Rectangle((0, 0), self.robot_length, self.robot_width,
+                                      facecolor=self.colors['robot'], alpha=0.8)
+        ax_anim.add_patch(robot_patch)
+        
+        trail_line, = ax_anim.plot([], [], color=self.colors['mpc_path'], 
+                                  linewidth=2, label='实际轨迹')
+        
+        ax_anim.set_xlabel('X (m)')
+        ax_anim.set_ylabel('Y (m)')
+        ax_anim.legend()
+        ax_anim.grid(True, alpha=0.3)
+        ax_anim.set_aspect('equal')
+        
+        # 设置坐标范围
+        all_x = np.concatenate([self.trajectory_data['x'].values if self.trajectory_data is not None else [0], 
+                               self.control_data['x'].values])
+        all_y = np.concatenate([self.trajectory_data['y'].values if self.trajectory_data is not None else [0], 
+                               self.control_data['y'].values])
+        
+        margin = 1.0
+        ax_anim.set_xlim(np.min(all_x) - margin, np.max(all_x) + margin)
+        ax_anim.set_ylim(np.min(all_y) - margin, np.max(all_y) + margin)
+        
+        def animate(frame):
+            if frame >= len(self.control_data):
+                return robot_patch, trail_line
+            
+            # 更新机器人位置
+            x = self.control_data['x'].iloc[frame]
+            y = self.control_data['y'].iloc[frame]
+            theta = self.control_data['theta'].iloc[frame]
+            
+            # 更新机器人矩形
+            robot_patch.set_xy((x - self.robot_length/2, y - self.robot_width/2))
+            robot_patch.angle = np.degrees(theta)
+            
+            # 更新轨迹尾迹
+            trail_x = self.control_data['x'].iloc[:frame+1].values
+            trail_y = self.control_data['y'].iloc[:frame+1].values
+            trail_line.set_data(trail_x, trail_y)
+            
+            return robot_patch, trail_line
+        
+        frames = min(len(self.control_data), 200)  # 限制帧数
+        anim = FuncAnimation(fig_anim, animate, frames=frames, interval=50, blit=True)
+        
+        plt.show()
+        return anim
+    
+    def show_plots(self):
+        """显示所有图表"""
+        self.plot_trajectory_overview()
+        self.plot_swept_volume_analysis()
+        self.plot_velocity_profiles()
+        self.plot_performance_metrics()
+        
+        plt.tight_layout()
+        plt.show()
+    
+    def save_plots(self, filename='trajectory_analysis.png'):
+        """保存图表"""
+        self.plot_trajectory_overview()
+        self.plot_swept_volume_analysis()
+        self.plot_velocity_profiles()
+        self.plot_performance_metrics()
+        
+        plt.tight_layout()
+        plt.savefig(filename, dpi=300, bbox_inches='tight')
+        print(f"图表已保存为 {filename}")
+
+def main():
+    parser = argparse.ArgumentParser(description='可视化扫掠体积感知轨迹规划结果')
+    parser.add_argument('--trajectory', default='trajectory_result.csv', 
+                       help='轨迹文件路径')
+    parser.add_argument('--control', default='mpc_control.csv', 
+                       help='控制文件路径')
+    parser.add_argument('--save', action='store_true', 
+                       help='保存图表而不显示')
+    parser.add_argument('--animate', action='store_true', 
+                       help='显示动画演示')
+    parser.add_argument('--output', default='trajectory_analysis.png', 
+                       help='输出文件名')
+    
+    args = parser.parse_args()
+    
+    # 创建可视化器
+    visualizer = TrajectoryVisualizer()
+    
+    # 加载数据
+    visualizer.load_data(args.trajectory, args.control)
+    
+    if args.save:
+        # 保存图表
+        visualizer.save_plots(args.output)
+    else:
+        # 显示图表
+        visualizer.show_plots()
+        
+        if args.animate:
+            # 显示动画
+            anim = visualizer.create_animation()
+
+if __name__ == '__main__':
+    # 检查依赖
+    try:
+        import scipy.spatial
+    except ImportError:
+        print("警告: 未安装scipy，部分功能可能不可用")
+        print("安装命令: pip install scipy")
+    
+    main()

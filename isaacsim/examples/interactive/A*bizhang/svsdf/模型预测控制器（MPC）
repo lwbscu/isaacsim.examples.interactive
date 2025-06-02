@@ -1,0 +1,616 @@
+#ifndef MPC_CONTROLLER_H
+#define MPC_CONTROLLER_H
+
+#include <Eigen/Dense>
+#include <vector>
+#include <memory>
+
+/**
+ * @brief 模型预测控制器（MPC）
+ * 
+ * 实现论文中的第四阶段：实时轨迹跟踪控制
+ * 
+ * 系统模型（两轮差分驱动）：
+ * x(k+1) = x(k) + T * v(k) * cos(θ(k))
+ * y(k+1) = y(k) + T * v(k) * sin(θ(k))  
+ * θ(k+1) = θ(k) + T * ω(k)
+ * 
+ * 控制输入：[v, ω] -> [v_left, v_right]
+ */
+class MPCController {
+public:
+    // MPC参数结构
+    struct MPCParams {
+        int prediction_horizon = 20;    // 预测时域 N_p
+        int control_horizon = 10;       // 控制时域 N_c  
+        double sample_time = 0.1;       // 采样时间 T
+        
+        // 权重矩阵
+        Eigen::Matrix3d Q = Eigen::Matrix3d::Identity() * 10.0;    // 状态权重
+        Eigen::Matrix2d R = Eigen::Matrix2d::Identity() * 1.0;     // 控制权重
+        
+        // 约束
+        double max_linear_vel = 1.0;    // 最大线速度 (m/s)
+        double max_angular_vel = 1.5;   // 最大角速度 (rad/s)
+        double max_linear_acc = 2.0;    // 最大线加速度 (m/s²)
+        double max_angular_acc = 3.0;   // 最大角加速度 (rad/s²)
+        
+        double wheel_base = 0.3;        // 轮距 (m)
+    };
+
+    // 状态和控制结构
+    struct State {
+        double x, y, theta;             // 位置和航向角
+        double v, omega;                // 线速度和角速度
+        
+        Eigen::Vector3d toVector3d() const {
+            return Eigen::Vector3d(x, y, theta);
+        }
+        
+        Eigen::Vector5d toVector5d() const {
+            return Eigen::Vector5d(x, y, theta, v, omega);
+        }
+    };
+
+    struct Control {
+        double linear_vel;              // 线速度
+        double angular_vel;             // 角速度
+        double v_left, v_right;         // 左右轮速度
+        
+        Eigen::Vector2d toVector2d() const {
+            return Eigen::Vector2d(linear_vel, angular_vel);
+        }
+    };
+
+    MPCController(const MPCParams& params);
+    ~MPCController() = default;
+
+    /**
+     * @brief 计算MPC控制输入
+     * 
+     * 求解二次规划问题：
+     * min J = Σ(||x(k|t) - x_ref(k|t)||²_Q + ||u(k|t)||²_R)
+     * s.t. x(k+1|t) = f(x(k|t), u(k|t))
+     *      u_min ≤ u(k|t) ≤ u_max
+     *      Δu_min ≤ Δu(k|t) ≤ Δu_max
+     * 
+     * @param current_state 当前状态
+     * @param reference_trajectory 参考轨迹
+     * @param current_time 当前时间
+     * @return 最优控制输入
+     */
+    Control computeControl(const State& current_state,
+                          const std::vector<State>& reference_trajectory,
+                          const std::vector<double>& reference_times,
+                          double current_time);
+
+    /**
+     * @brief 预测系统未来状态
+     * 
+     * @param initial_state 初始状态
+     * @param control_sequence 控制序列
+     * @return 预测状态序列
+     */
+    std::vector<State> predictStates(const State& initial_state,
+                                   const std::vector<Control>& control_sequence) const;
+
+    /**
+     * @brief 更新MPC参数
+     */
+    void updateParams(const MPCParams& params) { params_ = params; }
+    
+    /**
+     * @brief 获取最近一次的预测轨迹（用于可视化）
+     */
+    const std::vector<State>& getLastPrediction() const { return last_prediction_; }
+
+    /**
+     * @brief 获取计算时间统计
+     */
+    double getLastComputationTime() const { return last_computation_time_; }
+
+private:
+    MPCParams params_;
+    std::vector<State> last_prediction_;
+    double last_computation_time_;
+    
+    // 上一时刻的控制输入（用于计算控制增量约束）
+    Control last_control_;
+
+    /**
+     * @brief 差分驱动机器人的运动学模型
+     * 
+     * 状态方程：
+     * x' = v * cos(θ)
+     * y' = v * sin(θ)  
+     * θ' = ω
+     * 
+     * @param state 当前状态
+     * @param control 控制输入
+     * @param dt 时间步长
+     * @return 下一时刻状态
+     */
+    State applyDynamics(const State& state, const Control& control, double dt) const;
+
+    /**
+     * @brief 线性化系统模型
+     * 
+     * 在工作点 (x_ref, u_ref) 处线性化：
+     * x(k+1) = A*x(k) + B*u(k) + C
+     * 
+     * @param reference_state 参考状态点
+     * @param reference_control 参考控制点
+     * @param A 状态矩阵
+     * @param B 控制矩阵
+     * @param C 常数项
+     */
+    void linearizeModel(const State& reference_state,
+                       const Control& reference_control,
+                       Eigen::Matrix3d& A,
+                       Eigen::Matrix<double, 3, 2>& B,
+                       Eigen::Vector3d& C) const;
+
+    /**
+     * @brief 构建MPC优化问题的矩阵
+     * 
+     * 将MPC问题转化为标准QP形式：
+     * min 0.5 * U^T * H * U + g^T * U
+     * s.t. A_ineq * U ≤ b_ineq
+     * 
+     * @param current_state 当前状态
+     * @param reference_states 参考状态序列
+     * @param H Hessian矩阵
+     * @param g 梯度向量
+     * @param A_ineq 不等式约束矩阵
+     * @param b_ineq 不等式约束向量
+     */
+    void buildQPMatrices(const State& current_state,
+                        const std::vector<State>& reference_states,
+                        Eigen::MatrixXd& H,
+                        Eigen::VectorXd& g,
+                        Eigen::MatrixXd& A_ineq,
+                        Eigen::VectorXd& b_ineq) const;
+
+    /**
+     * @brief 求解二次规划问题
+     * 
+     * 使用内点法或有效集方法求解QP
+     * 
+     * @param H Hessian矩阵
+     * @param g 梯度向量  
+     * @param A_ineq 约束矩阵
+     * @param b_ineq 约束向量
+     * @param solution 解向量
+     * @return 是否成功求解
+     */
+    bool solveQP(const Eigen::MatrixXd& H,
+                const Eigen::VectorXd& g,
+                const Eigen::MatrixXd& A_ineq,
+                const Eigen::VectorXd& b_ineq,
+                Eigen::VectorXd& solution) const;
+
+    /**
+     * @brief 从参考轨迹中插值获取参考状态
+     */
+    std::vector<State> getReference(const std::vector<State>& reference_trajectory,
+                                  const std::vector<double>& reference_times,
+                                  double current_time) const;
+
+    /**
+     * @brief 控制输入转换：[v, ω] -> [v_left, v_right]
+     */
+    void velocityToWheelSpeeds(double linear_vel, double angular_vel,
+                              double& v_left, double& v_right) const;
+
+    /**
+     * @brief 约束检查和投影
+     */
+    Control clampControl(const Control& control) const;
+};
+
+// ========== 实现部分 ==========
+
+MPCController::MPCController(const MPCParams& params) 
+    : params_(params), last_computation_time_(0.0) {
+    last_control_.linear_vel = 0.0;
+    last_control_.angular_vel = 0.0;
+    last_control_.v_left = 0.0;
+    last_control_.v_right = 0.0;
+}
+
+MPCController::Control MPCController::computeControl(
+    const State& current_state,
+    const std::vector<State>& reference_trajectory,
+    const std::vector<double>& reference_times,
+    double current_time) {
+    
+    auto start_time = std::chrono::high_resolution_clock::now();
+    
+    // 1. 获取参考轨迹
+    std::vector<State> reference_states = getReference(reference_trajectory, 
+                                                      reference_times, 
+                                                      current_time);
+    
+    // 2. 构建QP矩阵
+    Eigen::MatrixXd H, A_ineq;
+    Eigen::VectorXd g, b_ineq;
+    buildQPMatrices(current_state, reference_states, H, g, A_ineq, b_ineq);
+    
+    // 3. 求解QP
+    Eigen::VectorXd solution;
+    bool success = solveQP(H, g, A_ineq, b_ineq, solution);
+    
+    Control control;
+    if (success && solution.size() >= 2) {
+        // 提取第一个控制输入（滚动时域原理）
+        control.linear_vel = solution(0);
+        control.angular_vel = solution(1);
+    } else {
+        // 失败时使用零控制
+        control.linear_vel = 0.0;
+        control.angular_vel = 0.0;
+    }
+    
+    // 4. 约束检查
+    control = clampControl(control);
+    
+    // 5. 转换为轮速
+    velocityToWheelSpeeds(control.linear_vel, control.angular_vel,
+                         control.v_left, control.v_right);
+    
+    // 6. 预测未来状态（用于可视化）
+    std::vector<Control> control_sequence(params_.prediction_horizon);
+    for (int i = 0; i < params_.prediction_horizon; ++i) {
+        if (i * 2 + 1 < solution.size()) {
+            control_sequence[i].linear_vel = solution(i * 2);
+            control_sequence[i].angular_vel = solution(i * 2 + 1);
+        } else {
+            control_sequence[i] = control;  // 重复最后一个控制
+        }
+    }
+    last_prediction_ = predictStates(current_state, control_sequence);
+    
+    // 7. 记录计算时间
+    auto end_time = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time);
+    last_computation_time_ = duration.count() / 1000.0;  // 转换为毫秒
+    
+    last_control_ = control;
+    return control;
+}
+
+void MPCController::buildQPMatrices(const State& current_state,
+                                   const std::vector<State>& reference_states,
+                                   Eigen::MatrixXd& H,
+                                   Eigen::VectorXd& g,
+                                   Eigen::MatrixXd& A_ineq,
+                                   Eigen::VectorXd& b_ineq) const {
+    /**
+     * MPC QP问题构建
+     * 
+     * 预测模型：X = Ψ*x(0) + Θ*U
+     * 代价函数：J = (X - X_ref)^T * Q_bar * (X - X_ref) + U^T * R_bar * U
+     * 
+     * 转化为标准QP：
+     * H = Θ^T * Q_bar * Θ + R_bar
+     * g = Θ^T * Q_bar * (Ψ*x(0) - X_ref)
+     */
+    
+    int N_p = params_.prediction_horizon;
+    int N_c = params_.control_horizon;
+    
+    // 线性化参考轨迹
+    std::vector<Eigen::Matrix3d> A_matrices(N_p);
+    std::vector<Eigen::Matrix<double, 3, 2>> B_matrices(N_p);
+    std::vector<Eigen::Vector3d> C_vectors(N_p);
+    
+    for (int i = 0; i < N_p; ++i) {
+        State ref_state = (i < reference_states.size()) ? reference_states[i] : reference_states.back();
+        Control ref_control;
+        ref_control.linear_vel = 0.0;  // 假设参考控制为零（可以改进）
+        ref_control.angular_vel = 0.0;
+        
+        linearizeModel(ref_state, ref_control, A_matrices[i], B_matrices[i], C_vectors[i]);
+    }
+    
+    // 构建预测矩阵 Ψ 和 Θ
+    Eigen::MatrixXd Psi(3 * N_p, 3);
+    Eigen::MatrixXd Theta(3 * N_p, 2 * N_c);
+    
+    Psi.setZero();
+    Theta.setZero();
+    
+    // 填充 Ψ 矩阵
+    Eigen::Matrix3d A_prod = Eigen::Matrix3d::Identity();
+    for (int i = 0; i < N_p; ++i) {
+        if (i > 0) {
+            A_prod = A_matrices[i-1] * A_prod;
+        }
+        Psi.block<3, 3>(i * 3, 0) = A_prod;
+    }
+    
+    // 填充 Θ 矩阵
+    for (int i = 0; i < N_p; ++i) {
+        for (int j = 0; j < N_c && j <= i; ++j) {
+            Eigen::Matrix3d A_prod_theta = Eigen::Matrix3d::Identity();
+            for (int k = j; k < i; ++k) {
+                A_prod_theta = A_matrices[k] * A_prod_theta;
+            }
+            Theta.block<3, 2>(i * 3, j * 2) = A_prod_theta * B_matrices[j];
+        }
+    }
+    
+    // 构建权重矩阵
+    Eigen::MatrixXd Q_bar = Eigen::MatrixXd::Zero(3 * N_p, 3 * N_p);
+    Eigen::MatrixXd R_bar = Eigen::MatrixXd::Zero(2 * N_c, 2 * N_c);
+    
+    for (int i = 0; i < N_p; ++i) {
+        Q_bar.block<3, 3>(i * 3, i * 3) = params_.Q;
+    }
+    
+    for (int i = 0; i < N_c; ++i) {
+        R_bar.block<2, 2>(i * 2, i * 2) = params_.R;
+    }
+    
+    // 构建参考轨迹向量
+    Eigen::VectorXd X_ref(3 * N_p);
+    for (int i = 0; i < N_p; ++i) {
+        State ref_state = (i < reference_states.size()) ? reference_states[i] : reference_states.back();
+        X_ref.segment<3>(i * 3) = ref_state.toVector3d();
+    }
+    
+    // 计算 H 和 g
+    H = Theta.transpose() * Q_bar * Theta + R_bar;
+    
+    Eigen::Vector3d x0 = current_state.toVector3d();
+    g = Theta.transpose() * Q_bar * (Psi * x0 - X_ref);
+    
+    // 构建约束矩阵
+    int num_constraints = 4 * N_c;  // 控制约束 + 控制增量约束
+    A_ineq.resize(num_constraints, 2 * N_c);
+    b_ineq.resize(num_constraints);
+    
+    A_ineq.setZero();
+    
+    int constraint_idx = 0;
+    
+    // 控制约束：u_min ≤ u ≤ u_max
+    for (int i = 0; i < N_c; ++i) {
+        // v ≤ v_max
+        A_ineq(constraint_idx, i * 2) = 1.0;
+        b_ineq(constraint_idx) = params_.max_linear_vel;
+        constraint_idx++;
+        
+        // -v ≤ -v_min (即 v ≥ v_min)
+        A_ineq(constraint_idx, i * 2) = -1.0;
+        b_ineq(constraint_idx) = params_.max_linear_vel;  // 假设对称约束
+        constraint_idx++;
+        
+        // ω ≤ ω_max
+        A_ineq(constraint_idx, i * 2 + 1) = 1.0;
+        b_ineq(constraint_idx) = params_.max_angular_vel;
+        constraint_idx++;
+        
+        // -ω ≤ -ω_min
+        A_ineq(constraint_idx, i * 2 + 1) = -1.0;
+        b_ineq(constraint_idx) = params_.max_angular_vel;
+        constraint_idx++;
+    }
+}
+
+bool MPCController::solveQP(const Eigen::MatrixXd& H,
+                           const Eigen::VectorXd& g,
+                           const Eigen::MatrixXd& A_ineq,
+                           const Eigen::VectorXd& b_ineq,
+                           Eigen::VectorXd& solution) const {
+    /**
+     * 简化的QP求解器
+     * 
+     * 使用无约束解作为初始解，然后投影到可行域
+     * 实际应用中建议使用专业QP求解器如OSQP、qpOASES等
+     */
+    
+    // 检查H的正定性
+    Eigen::LLT<Eigen::MatrixXd> llt(H);
+    if (llt.info() != Eigen::Success) {
+        // H不正定，添加正则化项
+        Eigen::MatrixXd H_reg = H + 1e-6 * Eigen::MatrixXd::Identity(H.rows(), H.cols());
+        solution = -H_reg.colPivHouseholderQr().solve(g);
+    } else {
+        // 无约束解：u* = -H^(-1) * g
+        solution = -llt.solve(g);
+    }
+    
+    // 简单的约束投影（可以改进为更精确的有效集方法）
+    for (int i = 0; i < A_ineq.rows(); ++i) {
+        double constraint_value = A_ineq.row(i).dot(solution);
+        if (constraint_value > b_ineq(i)) {
+            // 违反约束，进行投影
+            Eigen::VectorXd normal = A_ineq.row(i).transpose();
+            double violation = constraint_value - b_ineq(i);
+            solution -= (violation / normal.squaredNorm()) * normal;
+        }
+    }
+    
+    return true;
+}
+
+MPCController::State MPCController::applyDynamics(const State& state, 
+                                                 const Control& control, 
+                                                 double dt) const {
+    /**
+     * 差分驱动机器人运动学模型
+     * 
+     * 使用欧拉积分：
+     * x(k+1) = x(k) + dt * v(k) * cos(θ(k))
+     * y(k+1) = y(k) + dt * v(k) * sin(θ(k))
+     * θ(k+1) = θ(k) + dt * ω(k)
+     */
+    
+    State next_state;
+    
+    next_state.x = state.x + dt * control.linear_vel * std::cos(state.theta);
+    next_state.y = state.y + dt * control.linear_vel * std::sin(state.theta);
+    next_state.theta = state.theta + dt * control.angular_vel;
+    
+    // 角度归一化到 [-π, π]
+    while (next_state.theta > M_PI) next_state.theta -= 2 * M_PI;
+    while (next_state.theta < -M_PI) next_state.theta += 2 * M_PI;
+    
+    next_state.v = control.linear_vel;
+    next_state.omega = control.angular_vel;
+    
+    return next_state;
+}
+
+void MPCController::linearizeModel(const State& reference_state,
+                                  const Control& reference_control,
+                                  Eigen::Matrix3d& A,
+                                  Eigen::Matrix<double, 3, 2>& B,
+                                  Eigen::Vector3d& C) const {
+    /**
+     * 在参考点处线性化非线性模型
+     * 
+     * f(x, u) = [x + T*v*cos(θ), y + T*v*sin(θ), θ + T*ω]^T
+     * 
+     * A = ∂f/∂x |_(x_ref, u_ref)
+     * B = ∂f/∂u |_(x_ref, u_ref)
+     * C = f(x_ref, u_ref) - A*x_ref - B*u_ref
+     */
+    
+    double dt = params_.sample_time;
+    double theta_ref = reference_state.theta;
+    double v_ref = reference_control.linear_vel;
+    
+    // 状态矩阵 A = ∂f/∂x
+    A.setIdentity();
+    A(0, 2) = -dt * v_ref * std::sin(theta_ref);  // ∂x/∂θ
+    A(1, 2) = dt * v_ref * std::cos(theta_ref);   // ∂y/∂θ
+    
+    // 控制矩阵 B = ∂f/∂u
+    B.setZero();
+    B(0, 0) = dt * std::cos(theta_ref);  // ∂x/∂v
+    B(1, 0) = dt * std::sin(theta_ref);  // ∂y/∂v
+    B(2, 1) = dt;                        // ∂θ/∂ω
+    
+    // 常数项 C
+    State next_ref = applyDynamics(reference_state, reference_control, dt);
+    Eigen::Vector3d x_ref = reference_state.toVector3d();
+    Eigen::Vector2d u_ref = reference_control.toVector2d();
+    
+    C = next_ref.toVector3d() - A * x_ref - B * u_ref;
+}
+
+std::vector<MPCController::State> MPCController::predictStates(
+    const State& initial_state,
+    const std::vector<Control>& control_sequence) const {
+    
+    std::vector<State> predicted_states;
+    predicted_states.reserve(control_sequence.size() + 1);
+    
+    State current_state = initial_state;
+    predicted_states.push_back(current_state);
+    
+    for (const auto& control : control_sequence) {
+        current_state = applyDynamics(current_state, control, params_.sample_time);
+        predicted_states.push_back(current_state);
+    }
+    
+    return predicted_states;
+}
+
+void MPCController::velocityToWheelSpeeds(double linear_vel, double angular_vel,
+                                         double& v_left, double& v_right) const {
+    /**
+     * 差分驱动运动学逆解
+     * 
+     * v = (v_left + v_right) / 2
+     * ω = (v_right - v_left) / L
+     * 
+     * 逆解：
+     * v_left = v - ω*L/2
+     * v_right = v + ω*L/2
+     */
+    
+    double L = params_.wheel_base;
+    
+    v_left = linear_vel - angular_vel * L / 2.0;
+    v_right = linear_vel + angular_vel * L / 2.0;
+}
+
+MPCController::Control MPCController::clampControl(const Control& control) const {
+    Control clamped = control;
+    
+    clamped.linear_vel = std::max(-params_.max_linear_vel, 
+                                 std::min(params_.max_linear_vel, control.linear_vel));
+    clamped.angular_vel = std::max(-params_.max_angular_vel,
+                                  std::min(params_.max_angular_vel, control.angular_vel));
+    
+    return clamped;
+}
+
+std::vector<MPCController::State> MPCController::getReference(
+    const std::vector<State>& reference_trajectory,
+    const std::vector<double>& reference_times,
+    double current_time) const {
+    
+    std::vector<State> reference_states;
+    reference_states.reserve(params_.prediction_horizon);
+    
+    for (int i = 0; i < params_.prediction_horizon; ++i) {
+        double future_time = current_time + i * params_.sample_time;
+        
+        // 在参考轨迹中插值
+        if (reference_trajectory.empty()) {
+            State zero_state;
+            zero_state.x = zero_state.y = zero_state.theta = 0.0;
+            zero_state.v = zero_state.omega = 0.0;
+            reference_states.push_back(zero_state);
+            continue;
+        }
+        
+        // 边界情况
+        if (future_time <= reference_times.front()) {
+            reference_states.push_back(reference_trajectory.front());
+            continue;
+        }
+        if (future_time >= reference_times.back()) {
+            reference_states.push_back(reference_trajectory.back());
+            continue;
+        }
+        
+        // 线性插值
+        for (size_t j = 0; j < reference_times.size() - 1; ++j) {
+            if (future_time >= reference_times[j] && future_time <= reference_times[j+1]) {
+                double alpha = (future_time - reference_times[j]) / 
+                              (reference_times[j+1] - reference_times[j]);
+                
+                State interpolated;
+                interpolated.x = (1.0 - alpha) * reference_trajectory[j].x + 
+                                alpha * reference_trajectory[j+1].x;
+                interpolated.y = (1.0 - alpha) * reference_trajectory[j].y + 
+                                alpha * reference_trajectory[j+1].y;
+                
+                // 角度插值
+                double theta1 = reference_trajectory[j].theta;
+                double theta2 = reference_trajectory[j+1].theta;
+                double dtheta = theta2 - theta1;
+                if (dtheta > M_PI) dtheta -= 2 * M_PI;
+                if (dtheta < -M_PI) dtheta += 2 * M_PI;
+                interpolated.theta = theta1 + alpha * dtheta;
+                
+                interpolated.v = (1.0 - alpha) * reference_trajectory[j].v + 
+                                alpha * reference_trajectory[j+1].v;
+                interpolated.omega = (1.0 - alpha) * reference_trajectory[j].omega + 
+                                    alpha * reference_trajectory[j+1].omega;
+                
+                reference_states.push_back(interpolated);
+                break;
+            }
+        }
+    }
+    
+    return reference_states;
+}
+
+#endif // MPC_CONTROLLER_H

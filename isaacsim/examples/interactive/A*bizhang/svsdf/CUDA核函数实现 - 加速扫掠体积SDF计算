@@ -1,0 +1,523 @@
+/**
+ * @file cuda_kernels.cu
+ * @brief CUDA核函数实现 - 加速扫掠体积SDF计算
+ * 
+ * 实现论文中的并行计算加速：
+ * - 大规模网格点的并行SDF计算
+ * - Armijo线搜索并行优化
+ * - 内存合并访问优化
+ */
+
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+#include <cmath>
+
+// CUDA错误检查宏
+#define CUDA_CHECK(call) \
+    do { \
+        cudaError_t error = call; \
+        if (error != cudaSuccess) { \
+            printf("CUDA error at %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(error)); \
+            exit(1); \
+        } \
+    } while(0)
+
+// 常量定义
+__constant__ float c_robot_length;
+__constant__ float c_robot_width;
+__constant__ float c_armijo_c1 = 1e-4f;
+__constant__ float c_armijo_alpha = 0.5f;
+__constant__ int c_max_armijo_iter = 50;
+
+/**
+ * @brief 设备端矩形SDF计算
+ * 
+ * 对应论文Equation (7)的CUDA实现
+ */
+__device__ float device_rectangle_sdf(float x_local, float y_local, float length, float width) {
+    float dx = fabsf(x_local) - length * 0.5f;
+    float dy = fabsf(y_local) - width * 0.5f;
+    
+    if (dx > 0.0f && dy > 0.0f) {
+        // 外部角点：欧几里得距离
+        return sqrtf(dx * dx + dy * dy);
+    } else {
+        // 边界或内部：切比雪夫距离
+        return fmaxf(dx, dy);
+    }
+}
+
+/**
+ * @brief 设备端坐标变换：世界坐标 -> 机器人局部坐标
+ */
+__device__ void device_world_to_robot(float px, float py, float robot_x, float robot_y, float robot_theta,
+                                    float* local_x, float* local_y) {
+    // 平移
+    float tx = px - robot_x;
+    float ty = py - robot_y;
+    
+    // 旋转（逆变换）
+    float cos_theta = cosf(robot_theta);
+    float sin_theta = sinf(robot_theta);
+    
+    *local_x = cos_theta * tx + sin_theta * ty;
+    *local_y = -sin_theta * tx + cos_theta * ty;
+}
+
+/**
+ * @brief 设备端轨迹插值
+ */
+__device__ void device_interpolate_trajectory(const float* trajectory, int trajectory_size,
+                                            float time, float* pose) {
+    if (trajectory_size == 0) {
+        pose[0] = pose[1] = pose[2] = 0.0f;
+        return;
+    }
+    
+    if (trajectory_size == 1) {
+        pose[0] = trajectory[0];
+        pose[1] = trajectory[1]; 
+        pose[2] = trajectory[2];
+        return;
+    }
+    
+    // 边界情况
+    if (time <= trajectory[3]) {
+        pose[0] = trajectory[0];
+        pose[1] = trajectory[1];
+        pose[2] = trajectory[2];
+        return;
+    }
+    
+    if (time >= trajectory[(trajectory_size - 1) * 4 + 3]) {
+        int last_idx = (trajectory_size - 1) * 4;
+        pose[0] = trajectory[last_idx];
+        pose[1] = trajectory[last_idx + 1];
+        pose[2] = trajectory[last_idx + 2];
+        return;
+    }
+    
+    // 线性插值
+    for (int i = 0; i < trajectory_size - 1; i++) {
+        float t0 = trajectory[i * 4 + 3];
+        float t1 = trajectory[(i + 1) * 4 + 3];
+        
+        if (time >= t0 && time <= t1) {
+            float alpha = (time - t0) / (t1 - t0);
+            
+            pose[0] = (1.0f - alpha) * trajectory[i * 4] + alpha * trajectory[(i + 1) * 4];
+            pose[1] = (1.0f - alpha) * trajectory[i * 4 + 1] + alpha * trajectory[(i + 1) * 4 + 1];
+            
+            // 角度插值（处理周期性）
+            float theta0 = trajectory[i * 4 + 2];
+            float theta1 = trajectory[(i + 1) * 4 + 2];
+            float dtheta = theta1 - theta0;
+            
+            if (dtheta > M_PI) dtheta -= 2 * M_PI;
+            if (dtheta < -M_PI) dtheta += 2 * M_PI;
+            
+            pose[2] = theta0 + alpha * dtheta;
+            return;
+        }
+    }
+    
+    // 默认返回最后一个点
+    int last_idx = (trajectory_size - 1) * 4;
+    pose[0] = trajectory[last_idx];
+    pose[1] = trajectory[last_idx + 1];
+    pose[2] = trajectory[last_idx + 2];
+}
+
+/**
+ * @brief 设备端Armijo线搜索
+ * 
+ * 对查询点找到最优时间t*，使得SDF(point, robot_pose(t*))最小
+ */
+__device__ float device_armijo_line_search(float query_x, float query_y,
+                                         const float* trajectory, int trajectory_size) {
+    if (trajectory_size < 2) {
+        return trajectory[3];  // 返回第一个时间点
+    }
+    
+    float t_min = trajectory[3];
+    float t_max = trajectory[(trajectory_size - 1) * 4 + 3];
+    
+    // 初始猜测：中点
+    float t = (t_min + t_max) * 0.5f;
+    float step_size = (t_max - t_min) * 0.1f;
+    
+    float best_t = t;
+    float best_sdf = 1e6f;  // 很大的初始值
+    
+    // 简化的优化循环
+    for (int iter = 0; iter < c_max_armijo_iter; iter++) {
+        // 计算当前时间的SDF值
+        float pose[3];
+        device_interpolate_trajectory(trajectory, trajectory_size, t, pose);
+        
+        float local_x, local_y;
+        device_world_to_robot(query_x, query_y, pose[0], pose[1], pose[2], &local_x, &local_y);
+        
+        float current_sdf = device_rectangle_sdf(local_x, local_y, c_robot_length, c_robot_width);
+        
+        if (current_sdf < best_sdf) {
+            best_sdf = current_sdf;
+            best_t = t;
+        }
+        
+        // 计算梯度（数值微分）
+        float dt = 1e-6f;
+        float pose_plus[3];
+        device_interpolate_trajectory(trajectory, trajectory_size, t + dt, pose_plus);
+        
+        float local_x_plus, local_y_plus;
+        device_world_to_robot(query_x, query_y, pose_plus[0], pose_plus[1], pose_plus[2], 
+                            &local_x_plus, &local_y_plus);
+        
+        float sdf_plus = device_rectangle_sdf(local_x_plus, local_y_plus, c_robot_length, c_robot_width);
+        float gradient = (sdf_plus - current_sdf) / dt;
+        
+        // 梯度下降步骤
+        float new_t = t - step_size * gradient;
+        
+        // 约束在时间范围内
+        new_t = fmaxf(t_min, fminf(t_max, new_t));
+        
+        // Armijo条件检查
+        device_interpolate_trajectory(trajectory, trajectory_size, new_t, pose);
+        device_world_to_robot(query_x, query_y, pose[0], pose[1], pose[2], &local_x, &local_y);
+        float new_sdf = device_rectangle_sdf(local_x, local_y, c_robot_length, c_robot_width);
+        
+        if (new_sdf <= current_sdf + c_armijo_c1 * step_size * gradient * gradient) {
+            t = new_t;
+        } else {
+            step_size *= c_armijo_alpha;  // 缩减步长
+        }
+        
+        // 收敛检查
+        if (step_size < 1e-8f) {
+            break;
+        }
+    }
+    
+    return best_t;
+}
+
+/**
+ * @brief 扫掠体积SDF计算核函数
+ * 
+ * 每个线程处理一个查询点的SDF计算
+ * 
+ * @param query_points 查询点数组 [x0, y0, x1, y1, ...]
+ * @param trajectory 轨迹数组 [x0, y0, θ0, t0, x1, y1, θ1, t1, ...]
+ * @param sdf_values 输出SDF值数组
+ * @param num_points 查询点数量
+ * @param trajectory_size 轨迹点数量
+ */
+__global__ void swept_volume_sdf_kernel(const float* query_points,
+                                       const float* trajectory,
+                                       float* sdf_values,
+                                       int num_points,
+                                       int trajectory_size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (idx >= num_points) return;
+    
+    // 获取查询点坐标
+    float query_x = query_points[idx * 2];
+    float query_y = query_points[idx * 2 + 1];
+    
+    // 使用Armijo线搜索找最优时间
+    float optimal_time = device_armijo_line_search(query_x, query_y, trajectory, trajectory_size);
+    
+    // 在最优时间计算SDF
+    float pose[3];
+    device_interpolate_trajectory(trajectory, trajectory_size, optimal_time, pose);
+    
+    float local_x, local_y;
+    device_world_to_robot(query_x, query_y, pose[0], pose[1], pose[2], &local_x, &local_y);
+    
+    sdf_values[idx] = device_rectangle_sdf(local_x, local_y, c_robot_length, c_robot_width);
+}
+
+/**
+ * @brief 并行网格SDF计算核函数
+ * 
+ * 为规则网格上的所有点并行计算SDF
+ * 使用共享内存优化轨迹数据访问
+ */
+__global__ void grid_sdf_kernel(float* sdf_grid,
+                               const float* trajectory,
+                               int grid_width, int grid_height,
+                               float grid_resolution,
+                               float origin_x, float origin_y,
+                               int trajectory_size) {
+    int gx = blockIdx.x * blockDim.x + threadIdx.x;
+    int gy = blockIdx.y * blockDim.y + threadIdx.y;
+    
+    if (gx >= grid_width || gy >= grid_height) return;
+    
+    // 转换网格坐标到世界坐标
+    float world_x = origin_x + gx * grid_resolution;
+    float world_y = origin_y + gy * grid_resolution;
+    
+    // 计算扫掠体积SDF
+    float optimal_time = device_armijo_line_search(world_x, world_y, trajectory, trajectory_size);
+    
+    float pose[3];
+    device_interpolate_trajectory(trajectory, trajectory_size, optimal_time, pose);
+    
+    float local_x, local_y;
+    device_world_to_robot(world_x, world_y, pose[0], pose[1], pose[2], &local_x, &local_y);
+    
+    float sdf = device_rectangle_sdf(local_x, local_y, c_robot_length, c_robot_width);
+    
+    // 存储结果
+    int grid_idx = gy * grid_width + gx;
+    sdf_grid[grid_idx] = sdf;
+}
+
+/**
+ * @brief 蒙特卡洛体积估算核函数
+ * 
+ * 使用随机采样估算扫掠体积
+ */
+__global__ void monte_carlo_volume_kernel(const float* trajectory,
+                                        int trajectory_size,
+                                        float bbox_min_x, float bbox_min_y,
+                                        float bbox_max_x, float bbox_max_y,
+                                        int num_samples,
+                                        int* inside_count,
+                                        unsigned int seed) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (idx >= num_samples) return;
+    
+    // 初始化随机数生成器
+    curandState state;
+    curand_init(seed + idx, 0, 0, &state);
+    
+    // 生成随机采样点
+    float sample_x = bbox_min_x + curand_uniform(&state) * (bbox_max_x - bbox_min_x);
+    float sample_y = bbox_min_y + curand_uniform(&state) * (bbox_max_y - bbox_min_y);
+    
+    // 计算SDF
+    float optimal_time = device_armijo_line_search(sample_x, sample_y, trajectory, trajectory_size);
+    
+    float pose[3];
+    device_interpolate_trajectory(trajectory, trajectory_size, optimal_time, pose);
+    
+    float local_x, local_y;
+    device_world_to_robot(sample_x, sample_y, pose[0], pose[1], pose[2], &local_x, &local_y);
+    
+    float sdf = device_rectangle_sdf(local_x, local_y, c_robot_length, c_robot_width);
+    
+    // 原子操作累加内部点数
+    if (sdf <= 0.0f) {
+        atomicAdd(inside_count, 1);
+    }
+}
+
+/**
+ * @brief 梯度计算核函数
+ * 
+ * 并行计算SDF梯度，用于优化算法
+ */
+__global__ void sdf_gradient_kernel(const float* query_points,
+                                   const float* trajectory,
+                                   float* gradients,
+                                   int num_points,
+                                   int trajectory_size,
+                                   float eps = 1e-5f) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (idx >= num_points) return;
+    
+    float x = query_points[idx * 2];
+    float y = query_points[idx * 2 + 1];
+    
+    // 计算中心点SDF
+    float optimal_time = device_armijo_line_search(x, y, trajectory, trajectory_size);
+    float pose[3];
+    device_interpolate_trajectory(trajectory, trajectory_size, optimal_time, pose);
+    
+    float local_x, local_y;
+    device_world_to_robot(x, y, pose[0], pose[1], pose[2], &local_x, &local_y);
+    float sdf_center = device_rectangle_sdf(local_x, local_y, c_robot_length, c_robot_width);
+    
+    // X方向梯度
+    optimal_time = device_armijo_line_search(x + eps, y, trajectory, trajectory_size);
+    device_interpolate_trajectory(trajectory, trajectory_size, optimal_time, pose);
+    device_world_to_robot(x + eps, y, pose[0], pose[1], pose[2], &local_x, &local_y);
+    float sdf_x_plus = device_rectangle_sdf(local_x, local_y, c_robot_length, c_robot_width);
+    
+    // Y方向梯度
+    optimal_time = device_armijo_line_search(x, y + eps, trajectory, trajectory_size);
+    device_interpolate_trajectory(trajectory, trajectory_size, optimal_time, pose);
+    device_world_to_robot(x, y + eps, pose[0], pose[1], pose[2], &local_x, &local_y);
+    float sdf_y_plus = device_rectangle_sdf(local_x, local_y, c_robot_length, c_robot_width);
+    
+    // 存储梯度
+    gradients[idx * 2] = (sdf_x_plus - sdf_center) / eps;
+    gradients[idx * 2 + 1] = (sdf_y_plus - sdf_center) / eps;
+}
+
+// ========== C++接口函数 ==========
+
+extern "C" {
+
+/**
+ * @brief 设置CUDA常量
+ */
+void set_cuda_constants(float robot_length, float robot_width) {
+    CUDA_CHECK(cudaMemcpyToSymbol(c_robot_length, &robot_length, sizeof(float)));
+    CUDA_CHECK(cudaMemcpyToSymbol(c_robot_width, &robot_width, sizeof(float)));
+}
+
+/**
+ * @brief 启动扫掠体积SDF计算核函数
+ */
+void launch_swept_volume_kernel(const float* h_query_points,
+                               const float* h_trajectory,
+                               float* h_sdf_values,
+                               int num_points,
+                               int trajectory_size,
+                               float robot_length,
+                               float robot_width) {
+    // 设置常量
+    set_cuda_constants(robot_length, robot_width);
+    
+    // 分配设备内存
+    float *d_query_points, *d_trajectory, *d_sdf_values;
+    
+    CUDA_CHECK(cudaMalloc(&d_query_points, num_points * 2 * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_trajectory, trajectory_size * 4 * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_sdf_values, num_points * sizeof(float)));
+    
+    // 复制数据到设备
+    CUDA_CHECK(cudaMemcpy(d_query_points, h_query_points, 
+                         num_points * 2 * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_trajectory, h_trajectory, 
+                         trajectory_size * 4 * sizeof(float), cudaMemcpyHostToDevice));
+    
+    // 配置核函数启动参数
+    int block_size = 256;
+    int grid_size = (num_points + block_size - 1) / block_size;
+    
+    // 启动核函数
+    swept_volume_sdf_kernel<<<grid_size, block_size>>>(
+        d_query_points, d_trajectory, d_sdf_values, num_points, trajectory_size
+    );
+    
+    // 检查核函数错误
+    CUDA_CHECK(cudaGetLastError());
+    
+    // 复制结果回主机
+    CUDA_CHECK(cudaMemcpy(h_sdf_values, d_sdf_values, 
+                         num_points * sizeof(float), cudaMemcpyDeviceToHost));
+    
+    // 释放设备内存
+    CUDA_CHECK(cudaFree(d_query_points));
+    CUDA_CHECK(cudaFree(d_trajectory));
+    CUDA_CHECK(cudaFree(d_sdf_values));
+}
+
+/**
+ * @brief 启动网格SDF计算核函数
+ */
+void launch_grid_sdf_kernel(float* h_sdf_grid,
+                           const float* h_trajectory,
+                           int grid_width, int grid_height,
+                           float grid_resolution,
+                           float origin_x, float origin_y,
+                           int trajectory_size,
+                           float robot_length, float robot_width) {
+    // 设置常量
+    set_cuda_constants(robot_length, robot_width);
+    
+    // 分配设备内存
+    float *d_sdf_grid, *d_trajectory;
+    
+    int grid_size = grid_width * grid_height;
+    CUDA_CHECK(cudaMalloc(&d_sdf_grid, grid_size * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_trajectory, trajectory_size * 4 * sizeof(float)));
+    
+    // 复制轨迹数据到设备
+    CUDA_CHECK(cudaMemcpy(d_trajectory, h_trajectory, 
+                         trajectory_size * 4 * sizeof(float), cudaMemcpyHostToDevice));
+    
+    // 配置2D网格启动参数
+    dim3 block_size(16, 16);
+    dim3 grid_dim((grid_width + block_size.x - 1) / block_size.x,
+                  (grid_height + block_size.y - 1) / block_size.y);
+    
+    // 启动核函数
+    grid_sdf_kernel<<<grid_dim, block_size>>>(
+        d_sdf_grid, d_trajectory, grid_width, grid_height,
+        grid_resolution, origin_x, origin_y, trajectory_size
+    );
+    
+    // 检查错误
+    CUDA_CHECK(cudaGetLastError());
+    
+    // 复制结果回主机
+    CUDA_CHECK(cudaMemcpy(h_sdf_grid, d_sdf_grid, 
+                         grid_size * sizeof(float), cudaMemcpyDeviceToHost));
+    
+    // 释放内存
+    CUDA_CHECK(cudaFree(d_sdf_grid));
+    CUDA_CHECK(cudaFree(d_trajectory));
+}
+
+/**
+ * @brief 蒙特卡洛体积估算
+ */
+float monte_carlo_volume_estimation(const float* h_trajectory,
+                                   int trajectory_size,
+                                   float bbox_min_x, float bbox_min_y,
+                                   float bbox_max_x, float bbox_max_y,
+                                   int num_samples,
+                                   float robot_length, float robot_width) {
+    // 设置常量
+    set_cuda_constants(robot_length, robot_width);
+    
+    // 分配设备内存
+    float *d_trajectory;
+    int *d_inside_count, h_inside_count = 0;
+    
+    CUDA_CHECK(cudaMalloc(&d_trajectory, trajectory_size * 4 * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_inside_count, sizeof(int)));
+    
+    // 复制数据
+    CUDA_CHECK(cudaMemcpy(d_trajectory, h_trajectory, 
+                         trajectory_size * 4 * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_inside_count, &h_inside_count, sizeof(int), cudaMemcpyHostToDevice));
+    
+    // 启动核函数
+    int block_size = 256;
+    int grid_size = (num_samples + block_size - 1) / block_size;
+    unsigned int seed = time(NULL);
+    
+    monte_carlo_volume_kernel<<<grid_size, block_size>>>(
+        d_trajectory, trajectory_size,
+        bbox_min_x, bbox_min_y, bbox_max_x, bbox_max_y,
+        num_samples, d_inside_count, seed
+    );
+    
+    CUDA_CHECK(cudaGetLastError());
+    
+    // 获取结果
+    CUDA_CHECK(cudaMemcpy(&h_inside_count, d_inside_count, sizeof(int), cudaMemcpyDeviceToHost));
+    
+    // 计算体积
+    float bbox_area = (bbox_max_x - bbox_min_x) * (bbox_max_y - bbox_min_y);
+    float volume = bbox_area * static_cast<float>(h_inside_count) / num_samples;
+    
+    // 清理
+    CUDA_CHECK(cudaFree(d_trajectory));
+    CUDA_CHECK(cudaFree(d_inside_count));
+    
+    return volume;
+}
+
+} // extern "C"

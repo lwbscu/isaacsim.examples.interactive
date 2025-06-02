@@ -1,0 +1,388 @@
+#ifndef MINCO_TRAJECTORY_H
+#define MINCO_TRAJECTORY_H
+
+#include <Eigen/Dense>
+#include <vector>
+#include <functional>
+
+/**
+ * @brief MINCO (Minimum Control) 轨迹表示和优化类
+ * 
+ * 基于论文实现的稀疏轨迹参数化方法：
+ * - 使用5次多项式表示轨迹段
+ * - 稀疏控制点参数化
+ * - 支持时间和空间联合优化
+ */
+class MINCOTrajectory {
+public:
+    // 轨迹段结构
+    struct TrajectorySegment {
+        Eigen::VectorXd coeffs_x;   // x方向系数 [C0, C1, C2, C3, C4, C5]
+        Eigen::VectorXd coeffs_y;   // y方向系数
+        Eigen::VectorXd coeffs_yaw; // 偏航角系数
+        double duration;            // 段持续时间
+    };
+
+    MINCOTrajectory(int num_segments = 5);
+    ~MINCOTrajectory() = default;
+
+    /**
+     * @brief 从路径点初始化轨迹
+     * 
+     * @param waypoints 路径点 [x, y, yaw]
+     * @param initial_times 初始时间分配
+     */
+    void initializeFromWaypoints(
+        const std::vector<Eigen::Vector3d>& waypoints,
+        const std::vector<double>& initial_times
+    );
+
+    /**
+     * @brief 第一阶段优化：平滑化轨迹
+     * 最小化：J = W_E * J_E + W_T * J_T + W_P * J_P
+     * 
+     * @param weight_energy 能量权重
+     * @param weight_time 时间权重  
+     * @param weight_path 路径偏差权重
+     * @param reference_path 参考路径点
+     */
+    bool optimizeStage1(
+        double weight_energy,
+        double weight_time, 
+        double weight_path,
+        const std::vector<Eigen::Vector3d>& reference_path
+    );
+
+    /**
+     * @brief 第二阶段优化：扫掠体积最小化
+     * 最小化：J = W_E * J_E + W_T * J_T + W_ob * J_ob + W_sv * J_sv
+     * 
+     * @param weight_energy 能量权重
+     * @param weight_time 时间权重
+     * @param weight_obstacle 障碍物权重
+     * @param weight_swept_volume 扫掠体积权重
+     * @param obstacle_cost_func 障碍物代价函数
+     * @param swept_volume_cost_func 扫掠体积代价函数
+     */
+    bool optimizeStage2(
+        double weight_energy,
+        double weight_time,
+        double weight_obstacle,
+        double weight_swept_volume,
+        std::function<double(const Eigen::Vector3d&, const Eigen::Vector3d&)> obstacle_cost_func,
+        std::function<double(const std::vector<TrajectorySegment>&)> swept_volume_cost_func
+    );
+
+    /**
+     * @brief 获取指定时间的状态
+     * 
+     * @param t 时间
+     * @param position 位置输出 [x, y, yaw]
+     * @param velocity 速度输出 [vx, vy, omega]
+     * @param acceleration 加速度输出 [ax, ay, alpha]
+     * @return 是否成功
+     */
+    bool getState(double t, 
+                  Eigen::Vector3d& position,
+                  Eigen::Vector3d& velocity, 
+                  Eigen::Vector3d& acceleration) const;
+
+    /**
+     * @brief 获取轨迹总时间
+     */
+    double getTotalTime() const;
+
+    /**
+     * @brief 获取离散化轨迹点
+     * 
+     * @param dt 采样间隔
+     * @param positions 位置序列
+     * @param velocities 速度序列
+     * @param accelerations 加速度序列
+     * @param times 时间序列
+     */
+    void getDiscretizedTrajectory(
+        double dt,
+        std::vector<Eigen::Vector3d>& positions,
+        std::vector<Eigen::Vector3d>& velocities,
+        std::vector<Eigen::Vector3d>& accelerations,
+        std::vector<double>& times
+    ) const;
+
+    // 获取轨迹段数据
+    const std::vector<TrajectorySegment>& getSegments() const { return segments_; }
+
+private:
+    std::vector<TrajectorySegment> segments_;
+    int num_segments_;
+    
+    // 优化变量：控制点和时间分配
+    Eigen::MatrixXd control_points_;    // (N-1) x 3 控制点矩阵
+    Eigen::VectorXd time_allocation_;   // N 时间分配向量
+
+    /**
+     * @brief 从控制点和时间计算多项式系数
+     * 
+     * 根据MINCO理论，多项式系数通过以下映射计算：
+     * C_{i,j} = M(i, j, q, T)
+     * 其中 q 是控制点，T 是时间分配
+     */
+    void updateCoefficients();
+
+    /**
+     * @brief 计算能量代价及其梯度
+     * J_E = ∫(||u||²)dt，其中u是控制输入
+     */
+    double computeEnergyCost(Eigen::VectorXd& grad_q, Eigen::VectorXd& grad_T) const;
+
+    /**
+     * @brief 计算时间代价及其梯度
+     * J_T = ∑T_i
+     */
+    double computeTimeCost(Eigen::VectorXd& grad_T) const;
+
+    /**
+     * @brief 计算路径偏差代价及其梯度
+     * J_P = ∑||P_j - P_{A*,j}||²
+     */
+    double computePathDeviationCost(
+        const std::vector<Eigen::Vector3d>& reference_path,
+        Eigen::VectorXd& grad_q,
+        Eigen::VectorXd& grad_T
+    ) const;
+
+    /**
+     * @brief 计算扫掠角度偏差代价
+     * 确保机器人长轴始终与轨迹方向平行，最小化扫掠体积
+     * J_sv = ∑(Δφ_j)²，其中 Δφ_j = φ_j - arctan(V_y/V_x)
+     */
+    double computeSweptAngleCost(Eigen::VectorXd& grad_q, Eigen::VectorXd& grad_T) const;
+
+    /**
+     * @brief L-BFGS优化求解器
+     * 
+     * @param cost_func 代价函数
+     * @param grad_func 梯度函数
+     * @param initial_x 初始变量
+     * @param result_x 优化结果
+     * @return 是否收敛
+     */
+    bool lbfgsOptimize(
+        std::function<double(const Eigen::VectorXd&)> cost_func,
+        std::function<void(const Eigen::VectorXd&, Eigen::VectorXd&)> grad_func,
+        const Eigen::VectorXd& initial_x,
+        Eigen::VectorXd& result_x
+    ) const;
+
+    // 工具函数
+    void setControlPoints(const Eigen::MatrixXd& points);
+    void setTimeAllocation(const Eigen::VectorXd& times);
+    
+    // 多项式计算函数
+    Eigen::Vector3d evaluatePolynomial(int segment_idx, double t_local) const;
+    Eigen::Vector3d evaluatePolynomialVelocity(int segment_idx, double t_local) const;
+    Eigen::Vector3d evaluatePolynomialAcceleration(int segment_idx, double t_local) const;
+    
+    // 时间映射：全局时间 -> (段索引, 局部时间)
+    std::pair<int, double> getSegmentAndLocalTime(double global_time) const;
+};
+
+// ========== 实现部分 ==========
+
+MINCOTrajectory::MINCOTrajectory(int num_segments) 
+    : num_segments_(num_segments) {
+    segments_.resize(num_segments_);
+    control_points_.resize(num_segments_ - 1, 3);
+    time_allocation_.resize(num_segments_);
+}
+
+void MINCOTrajectory::initializeFromWaypoints(
+    const std::vector<Eigen::Vector3d>& waypoints,
+    const std::vector<double>& initial_times) {
+    
+    // 验证输入
+    if (waypoints.size() != num_segments_ + 1) {
+        throw std::invalid_argument("路径点数量应该等于段数+1");
+    }
+    if (initial_times.size() != num_segments_) {
+        throw std::invalid_argument("时间分配数量应该等于段数");
+    }
+
+    // 初始化控制点：使用路径点的中间值
+    for (int i = 0; i < num_segments_ - 1; ++i) {
+        control_points_.row(i) = waypoints[i + 1];
+    }
+
+    // 初始化时间分配
+    for (int i = 0; i < num_segments_; ++i) {
+        time_allocation_(i) = initial_times[i];
+    }
+
+    // 计算初始多项式系数
+    updateCoefficients();
+}
+
+void MINCOTrajectory::updateCoefficients() {
+    /**
+     * MINCO多项式系数计算
+     * 
+     * 对于每个轨迹段 j，5次多项式为：
+     * P_j(t) = C_{0,j} + C_{1,j}*t + C_{2,j}*t² + C_{3,j}*t³ + C_{4,j}*t⁴ + C_{5,j}*t⁵
+     * 
+     * 边界条件：
+     * - 位置连续性：P_j(T_j) = P_{j+1}(0)
+     * - 速度连续性：P'_j(T_j) = P'_{j+1}(0)  
+     * - 加速度连续性：P''_j(T_j) = P''_{j+1}(0)
+     */
+    
+    for (int seg = 0; seg < num_segments_; ++seg) {
+        double T = time_allocation_(seg);
+        
+        // 获取边界条件
+        Eigen::Vector3d p0, p1, v0, v1, a0, a1;
+        
+        if (seg == 0) {
+            // 第一段：起点固定
+            p0 = control_points_.row(0);  // 使用第一个控制点作为起点
+            v0 = Eigen::Vector3d::Zero();
+            a0 = Eigen::Vector3d::Zero();
+        } else {
+            // 中间段：继承前一段的末端状态
+            p0 = control_points_.row(seg - 1);
+            // 这里需要从前一段计算速度和加速度
+            v0 = evaluatePolynomialVelocity(seg - 1, time_allocation_(seg - 1));
+            a0 = evaluatePolynomialAcceleration(seg - 1, time_allocation_(seg - 1));
+        }
+        
+        if (seg == num_segments_ - 1) {
+            // 最后一段：终点固定
+            p1 = control_points_.row(seg);  // 使用最后一个控制点作为终点
+            v1 = Eigen::Vector3d::Zero();
+            a1 = Eigen::Vector3d::Zero();
+        } else {
+            // 中间段：连接到下一个控制点
+            p1 = control_points_.row(seg);
+            v1 = Eigen::Vector3d::Zero();  // 简化：中间点速度为零
+            a1 = Eigen::Vector3d::Zero();  // 简化：中间点加速度为零
+        }
+
+        // 构建约束矩阵 A * coeffs = b
+        // 6个约束：p(0), v(0), a(0), p(T), v(T), a(T)
+        Eigen::Matrix<double, 6, 6> A;
+        A << 1, 0, 0,   0,     0,      0,      // p(0)
+             0, 1, 0,   0,     0,      0,      // v(0)
+             0, 0, 2,   0,     0,      0,      // a(0)
+             1, T, T*T, T*T*T, T*T*T*T, T*T*T*T*T, // p(T)
+             0, 1, 2*T, 3*T*T, 4*T*T*T, 5*T*T*T*T, // v(T)
+             0, 0, 2,   6*T,   12*T*T,  20*T*T*T;   // a(T)
+
+        // 分别计算 x, y, yaw 的系数
+        for (int axis = 0; axis < 3; ++axis) {
+            Eigen::Vector<double, 6> b;
+            b << p0(axis), v0(axis), a0(axis), p1(axis), v1(axis), a1(axis);
+            
+            Eigen::Vector<double, 6> coeffs = A.colPivHouseholderQr().solve(b);
+            
+            if (axis == 0) {
+                segments_[seg].coeffs_x = coeffs;
+            } else if (axis == 1) {
+                segments_[seg].coeffs_y = coeffs;
+            } else {
+                segments_[seg].coeffs_yaw = coeffs;
+            }
+        }
+        
+        segments_[seg].duration = T;
+    }
+}
+
+bool MINCOTrajectory::optimizeStage1(
+    double weight_energy,
+    double weight_time,
+    double weight_path,
+    const std::vector<Eigen::Vector3d>& reference_path) {
+    
+    /**
+     * 第一阶段优化：平滑化
+     * 
+     * 最小化：J = W_E * J_E + W_T * J_T + W_P * J_P
+     * 
+     * 优化变量：[control_points; time_allocation]
+     */
+    
+    // 组装优化变量：控制点 + 时间分配
+    int dim_q = control_points_.rows() * control_points_.cols();  // 控制点维度
+    int dim_T = time_allocation_.size();                         // 时间维度
+    int total_dim = dim_q + dim_T;
+
+    Eigen::VectorXd x(total_dim);
+    // 填充控制点
+    for (int i = 0; i < control_points_.rows(); ++i) {
+        for (int j = 0; j < 3; ++j) {
+            x(i * 3 + j) = control_points_(i, j);
+        }
+    }
+    // 填充时间分配
+    for (int i = 0; i < dim_T; ++i) {
+        x(dim_q + i) = time_allocation_(i);
+    }
+
+    // 定义代价函数
+    auto cost_func = [&](const Eigen::VectorXd& vars) -> double {
+        // 更新当前变量
+        updateFromOptimizationVector(vars);
+        updateCoefficients();
+        
+        // 计算各项代价
+        Eigen::VectorXd grad_q_dummy, grad_T_dummy;
+        double J_E = computeEnergyCost(grad_q_dummy, grad_T_dummy);
+        double J_T = computeTimeCost(grad_T_dummy);
+        double J_P = computePathDeviationCost(reference_path, grad_q_dummy, grad_T_dummy);
+        
+        return weight_energy * J_E + weight_time * J_T + weight_path * J_P;
+    };
+
+    // 定义梯度函数
+    auto grad_func = [&](const Eigen::VectorXd& vars, Eigen::VectorXd& grad) {
+        updateFromOptimizationVector(vars);
+        updateCoefficients();
+        
+        Eigen::VectorXd grad_q_E, grad_T_E, grad_q_P, grad_T_P, grad_T_T;
+        
+        computeEnergyCost(grad_q_E, grad_T_E);
+        computeTimeCost(grad_T_T);
+        computePathDeviationCost(reference_path, grad_q_P, grad_T_P);
+        
+        // 组装总梯度
+        grad.resize(total_dim);
+        
+        // 控制点梯度
+        for (int i = 0; i < dim_q; ++i) {
+            grad(i) = weight_energy * grad_q_E(i) + weight_path * grad_q_P(i);
+        }
+        
+        // 时间分配梯度
+        for (int i = 0; i < dim_T; ++i) {
+            grad(dim_q + i) = weight_energy * grad_T_E(i) + 
+                              weight_time * grad_T_T(i) + 
+                              weight_path * grad_T_P(i);
+        }
+    };
+
+    // 调用L-BFGS优化
+    Eigen::VectorXd result_x;
+    bool success = lbfgsOptimize(cost_func, grad_func, x, result_x);
+    
+    if (success) {
+        updateFromOptimizationVector(result_x);
+        updateCoefficients();
+    }
+    
+    return success;
+}
+
+// 其他方法的实现...
+// 由于篇幅限制，这里展示核心框架
+// 完整实现将在后续代码中提供
+
+#endif // MINCO_TRAJECTORY_H

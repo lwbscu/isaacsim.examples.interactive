@@ -27,6 +27,9 @@ from isaacsim.core.utils.stage import add_reference_to_stage
 from pxr import UsdGeom, Gf, Usd
 import isaacsim.core.utils.prims as prim_utils
 
+# SVSDF轨迹规划器导入
+from svsdf_planner import SVSDFPlanner, RobotParams, TrajectoryPoint
+
 # 设置资源路径
 asset_root = "/home/lwb/isaacsim_assets/Assets/Isaac/4.5"
 carb.settings.get_settings().set("/persistent/isaac/asset_root/default", asset_root)
@@ -202,6 +205,24 @@ class InteractiveAvoidanceRobot:
         # 路径规划器
         self.planner = SimpleAStarPlanner()
         
+        # SVSDF轨迹规划器
+        robot_params = RobotParams(
+            length=0.35,      # Create-3机器人长度
+            width=0.33,       # Create-3机器人宽度  
+            wheel_base=0.235, # Create-3轮距
+            max_vel=0.5,      # 最大线速度
+            max_omega=1.5,    # 最大角速度
+            max_acc=2.0,      # 最大线加速度
+            max_alpha=3.0     # 最大角加速度
+        )
+        self.svsdf_planner = SVSDFPlanner(robot_params)
+        
+        # 轨迹跟踪变量
+        self.current_trajectory = []
+        self.trajectory_index = 0
+        self.use_svsdf = True  # 是否使用SVSDF轨迹优化
+        self.trajectory_markers = []  # 轨迹可视化标记
+        
         # 状态变量
         self.current_path = []
         self.waypoint_index = 0
@@ -239,6 +260,8 @@ class InteractiveAvoidanceRobot:
             "SPACE": "toggle_auto",   # 开始/停止自动导航
             "R": "replan",           # 重新规划路径
             "T": "new_target",       # 设置新目标
+            "S": "toggle_svsdf",     # 切换SVSDF/A*规划模式
+            "V": "visualize_trajectory", # 可视化当前轨迹
         }
         
         # 设置初始位置
@@ -274,6 +297,10 @@ class InteractiveAvoidanceRobot:
                     self.request_replan()
                 elif action == "new_target":
                     self.set_random_target()
+                elif action == "toggle_svsdf":
+                    self.toggle_svsdf_mode()
+                elif action == "visualize_trajectory":
+                    self.visualize_current_trajectory()
                     
         return True
     
@@ -450,27 +477,86 @@ class InteractiveAvoidanceRobot:
             self.target_cube = None
     
     def plan_path(self):
-        """规划路径"""
-        current_pos, _ = self.get_robot_pose()
+        """规划路径 - 集成SVSDF轨迹优化"""
+        current_pos, current_rot = self.get_robot_pose()
         print(f"Planning path from {current_pos[:2]} to {self.goal_pos[:2]}")
+        print(f"Using {'SVSDF trajectory optimization' if self.use_svsdf else 'simple A* planning'}")
         
         # 先清除旧的路径可视化
         self.clear_path_markers()
+        self.clear_trajectory_markers()
         
-        self.current_path = self.planner.find_path(
+        # 第一步：使用A*生成初始路径
+        astar_path = self.planner.find_path(
             [current_pos[0], current_pos[1]], 
             [self.goal_pos[0], self.goal_pos[1]]
         )
         
-        if not self.current_path:
-            print("No path found!")
+        if not astar_path:
+            print("No A* path found!")
             self.state = "IDLE"
             return False
         
+        # 将A*路径转换为简单的(x,y)元组列表
+        simple_path = [(point[0], point[1]) for point in astar_path]
+        
+        if self.use_svsdf:
+            # 第二步：使用SVSDF优化轨迹
+            try:
+                # 获取当前机器人状态
+                current_yaw = self.get_robot_yaw()
+                start_state = np.array([current_pos[0], current_pos[1], current_yaw, 0.0, 0.0, 0.0])
+                
+                # 计算目标朝向（朝向目标点）
+                goal_yaw = math.atan2(self.goal_pos[1] - current_pos[1], 
+                                    self.goal_pos[0] - current_pos[0])
+                goal_state = np.array([self.goal_pos[0], self.goal_pos[1], goal_yaw, 0.0, 0.0, 0.0])
+                
+                # 获取障碍物信息
+                obstacles = self.get_obstacle_info()
+                
+                # 运行SVSDF轨迹优化
+                print("🚀 Running SVSDF trajectory optimization...")
+                trajectory, info = self.svsdf_planner.plan_trajectory(
+                    start_state, goal_state, simple_path, obstacles
+                )
+                
+                if trajectory:
+                    self.current_trajectory = trajectory
+                    self.current_path = simple_path  # 保留A*路径用于fallback
+                    self.trajectory_index = 0
+                    
+                    # 可视化
+                    self.visualize_path()  # A*路径（绿色）
+                    self.visualize_trajectory()  # SVSDF轨迹（蓝色）
+                    
+                    print(f"✅ SVSDF trajectory planning successful!")
+                    print(f"   - Trajectory points: {len(trajectory)}")
+                    print(f"   - Swept volume: {info['swept_volume']:.3f}m³")
+                    print(f"   - Total time: {info['total_time']:.3f}s")
+                    return True
+                else:
+                    print("❌ SVSDF optimization failed, falling back to A* path")
+                    self.use_simple_path_following(simple_path)
+                    return True
+                    
+            except Exception as e:
+                print(f"❌ SVSDF planning error: {e}")
+                print("Falling back to simple A* path following")
+                self.use_simple_path_following(simple_path)
+                return True
+        else:
+            # 使用简单的A*路径跟踪
+            self.use_simple_path_following(simple_path)
+            return True
+    
+    def use_simple_path_following(self, astar_path):
+        """使用简单的A*路径跟踪"""
+        self.current_path = astar_path
+        self.current_trajectory = []  # 清空轨迹
         self.waypoint_index = 0
         self.visualize_path()
-        print(f"Path planned with {len(self.current_path)} waypoints")
-        return True
+        print(f"Using simple A* path with {len(astar_path)} waypoints")
     
     def visualize_path(self):
         """可视化路径 - 使用FixedCuboid避免物理系统冲突"""
@@ -527,6 +613,124 @@ class InteractiveAvoidanceRobot:
         except Exception as e:
             print(f"Warning: Could not clear path markers: {e}")
     
+    def toggle_svsdf_mode(self):
+        """切换SVSDF/A*规划模式"""
+        self.use_svsdf = not self.use_svsdf
+        mode_name = "SVSDF trajectory optimization" if self.use_svsdf else "Simple A* planning"
+        print(f"🔄 Switched to {mode_name} mode")
+        
+        # 如果正在导航，重新规划
+        if self.auto_navigation:
+            self.request_replan()
+    
+    def get_robot_yaw(self):
+        """获取机器人当前偏航角"""
+        try:
+            _, rotation = self.get_robot_pose()
+            # 从四元数转换为欧拉角
+            r = R.from_quat([rotation[1], rotation[2], rotation[3], rotation[0]])  # xyzw to wxyz
+            euler = r.as_euler('xyz')
+            return euler[2]  # yaw角
+        except:
+            return 0.0
+    
+    def get_obstacle_info(self):
+        """获取障碍物信息，用于SVSDF规划"""
+        obstacles = []
+        
+        # 静态障碍物
+        static_obstacles = [
+            {"center": [3, 3, 0.5], "size": [2, 2, 1]},
+            {"center": [-3, -3, 0.5], "size": [2, 2, 1]},
+            {"center": [6, -2, 0.5], "size": [1.5, 3, 1]},
+            {"center": [-4, 4, 0.5], "size": [3, 1.5, 1]},
+            {"center": [0, 0, 0.5], "size": [1, 4, 1]},
+        ]
+        
+        for obs in static_obstacles:
+            obstacles.append({
+                'center': obs['center'],
+                'size': obs['size']
+            })
+        
+        # 边界墙
+        boundary_walls = [
+            {"center": [0, 13, 0.5], "size": [26, 1, 1]},
+            {"center": [0, -13, 0.5], "size": [26, 1, 1]},
+            {"center": [13, 0, 0.5], "size": [1, 26, 1]},
+            {"center": [-13, 0, 0.5], "size": [1, 26, 1]},
+        ]
+        
+        for wall in boundary_walls:
+            obstacles.append({
+                'center': wall['center'],
+                'size': wall['size']
+            })
+        
+        return obstacles
+    
+    def clear_trajectory_markers(self):
+        """清除轨迹可视化标记"""
+        try:
+            for marker in self.trajectory_markers:
+                if marker and hasattr(marker, 'prim_path'):
+                    prim_path = marker.prim_path
+                    if self.world.stage.GetPrimAtPath(prim_path):
+                        self.world.stage.RemovePrim(prim_path)
+            self.trajectory_markers.clear()
+            print(f"Cleared {len(self.trajectory_markers)} trajectory markers")
+        except Exception as e:
+            print(f"Error clearing trajectory markers: {e}")
+    
+    def visualize_trajectory(self):
+        """可视化SVSDF优化后的轨迹"""
+        if not self.current_trajectory:
+            print("No trajectory to visualize")
+            return
+        
+        print(f"🎨 Visualizing SVSDF trajectory with {len(self.current_trajectory)} points")
+        
+        try:
+            # 清除旧的轨迹标记
+            self.clear_trajectory_markers()
+            
+            # 使用蓝色标记显示轨迹，每5个点显示一个标记以避免过密
+            step = max(1, len(self.current_trajectory) // 20)  # 最多显示20个标记
+            created_count = 0
+            
+            for i in range(0, len(self.current_trajectory), step):
+                traj_point = self.current_trajectory[i]
+                marker_path = f"/World/trajectory_marker_{i}"
+                
+                try:
+                    # 使用蓝色标记区分SVSDF轨迹
+                    traj_marker = self.world.scene.add(
+                        FixedCuboid(
+                            prim_path=marker_path,
+                            name=f"trajectory_marker_{i}",
+                            position=np.array([traj_point.position[0], traj_point.position[1], 2.5]),
+                            scale=np.array([0.2, 0.2, 0.2]),
+                            color=np.array([0.0, 0.5, 1.0])  # 蓝色
+                        )
+                    )
+                    self.trajectory_markers.append(traj_marker)
+                    created_count += 1
+                except Exception as e:
+                    print(f"Failed to create trajectory marker {i}: {e}")
+            
+            print(f"✅ Created {created_count} trajectory markers (blue)")
+        
+        except Exception as e:
+            print(f"❌ Error visualizing trajectory: {e}")
+    
+    def visualize_current_trajectory(self):
+        """手动触发轨迹可视化"""
+        if self.current_trajectory:
+            self.visualize_trajectory()
+            print("📊 Current trajectory visualization refreshed")
+        else:
+            print("❌ No current trajectory to visualize")
+    
     def update(self):
         """更新机器人状态"""
         # 检查目标是否改变
@@ -559,7 +763,76 @@ class InteractiveAvoidanceRobot:
         return True
     
     def follow_path(self):
-        """跟随路径 - 改进版本确保机器人实际移动"""
+        """跟随路径 - 支持SVSDF轨迹跟踪和简单A*路径跟踪"""
+        if self.current_trajectory:
+            # 使用SVSDF轨迹跟踪
+            return self.follow_trajectory()
+        else:
+            # 使用简单A*路径跟踪
+            return self.follow_simple_path()
+    
+    def follow_trajectory(self):
+        """跟随SVSDF优化后的轨迹"""
+        if self.trajectory_index >= len(self.current_trajectory):
+            self.state = "REACHED"
+            return True
+        
+        current_pos, _ = self.get_robot_pose()
+        current_yaw = self.get_robot_yaw()
+        
+        # 获取当前轨迹点
+        traj_point = self.current_trajectory[self.trajectory_index]
+        target_pos = traj_point.position[:2]
+        target_yaw = traj_point.position[2]
+        
+        # 计算到目标的距离和角度
+        dx = target_pos[0] - current_pos[0]
+        dy = target_pos[1] - current_pos[1]
+        distance = math.sqrt(dx**2 + dy**2)
+        
+        # 调试信息
+        if self.trajectory_index % 10 == 0:
+            print(f"🤖 Trajectory point {self.trajectory_index}/{len(self.current_trajectory)}: "
+                  f"Pos: ({current_pos[0]:.2f}, {current_pos[1]:.2f}), "
+                  f"Target: ({target_pos[0]:.2f}, {target_pos[1]:.2f}), "
+                  f"Distance: {distance:.2f}m")
+        
+        # 控制逻辑
+        if distance < 0.3:  # 到达当前轨迹点
+            self.trajectory_index += 1
+            if self.trajectory_index >= len(self.current_trajectory):
+                self.state = "REACHED"
+                return True
+        
+        # 计算控制指令
+        target_angle = math.atan2(dy, dx)
+        angle_diff = target_angle - current_yaw
+        while angle_diff > math.pi:
+            angle_diff -= 2 * math.pi
+        while angle_diff < -math.pi:
+            angle_diff += 2 * math.pi
+        
+        # PID控制器参数（轨迹跟踪）
+        linear_speed = min(0.4, distance * 1.5)  # 稍快的线速度
+        angular_speed = angle_diff * 2.0  # 角速度控制
+        
+        # 限制速度
+        angular_speed = max(-1.2, min(1.2, angular_speed))
+        
+        # 如果角度差太大，先转向
+        if abs(angle_diff) > math.pi/3:
+            linear_speed *= 0.3
+        
+        # 发送控制指令
+        try:
+            self.controller.forward(command=[linear_speed, angular_speed])
+        except Exception as e:
+            print(f"Control error: {e}")
+        
+        return True
+    
+    def follow_simple_path(self):
+        """跟随简单A*路径"""
         if self.waypoint_index >= len(self.current_path):
             self.state = "REACHED"
             return True
@@ -580,8 +853,8 @@ class InteractiveAvoidanceRobot:
         while angle_diff < -math.pi:
             angle_diff += 2 * math.pi
         
-        # 调试信息 - 更频繁地输出，确保能看到机器人在移动
-        if self.waypoint_index % 5 == 0:  # 每5个航点输出一次调试信息
+        # 调试信息 
+        if self.waypoint_index % 5 == 0:
             print(f"🤖 Waypoint {self.waypoint_index}/{len(self.current_path)}: "
                   f"Pos: ({current_pos[0]:.2f}, {current_pos[1]:.2f}), "
                   f"Target: ({target[0]:.2f}, {target[1]:.2f}), "
@@ -640,19 +913,22 @@ def main():
     robot.create_obstacles()
     
     # 显示控制说明
-    print("\n" + "="*60)
-    print("INTERACTIVE A* PATHFINDING CONTROLS:")
-    print("="*60)
+    print("\n" + "="*70)
+    print("INTERACTIVE A* + SVSDF TRAJECTORY PLANNING CONTROLS:")
+    print("="*70)
     print("Arrow Keys / NUMPAD: Move target position")
     print("SPACE: Toggle auto navigation ON/OFF")
     print("R: Force replan current path")
     print("T: Set random target position")
+    print("S: Toggle SVSDF/A* planning mode")
+    print("V: Visualize current trajectory")
     print("ESC: Exit simulation")
-    print("="*60)
+    print("="*70)
     print(f"Robot starting position: {robot.start_pos[:2]}")
     print(f"Target position: {robot.goal_pos[:2]}")
+    print(f"Planning mode: {'SVSDF trajectory optimization' if robot.use_svsdf else 'Simple A* planning'}")
     print("Use SPACE to start auto navigation!")
-    print("="*60 + "\n")
+    print("="*70 + "\n")
     
     step_count = 0
     
@@ -664,12 +940,16 @@ def main():
         # 每300步显示一次状态
         if step_count % 300 == 0:
             status = "AUTO" if robot.auto_navigation else "MANUAL"
+            mode = "SVSDF" if robot.use_svsdf else "A*"
             current_pos, _ = robot.get_robot_pose()
-            print(f"Step: {step_count}, Mode: {status}, State: {robot.state}, "
+            print(f"Step: {step_count}, Mode: {status}/{mode}, State: {robot.state}, "
                   f"Pos: ({current_pos[0]:.2f}, {current_pos[1]:.2f})")
             
-            if robot.state == "MOVING" and robot.current_path:
-                print(f"   📍 Waypoint: {robot.waypoint_index}/{len(robot.current_path)}")
+            if robot.state == "MOVING":
+                if robot.current_trajectory:
+                    print(f"   🔵 SVSDF Trajectory: {robot.trajectory_index}/{len(robot.current_trajectory)}")
+                elif robot.current_path:
+                    print(f"   🟢 A* Path: {robot.waypoint_index}/{len(robot.current_path)}")
         
         robot.update()
     

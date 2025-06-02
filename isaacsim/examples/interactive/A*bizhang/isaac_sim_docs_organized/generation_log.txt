@@ -1,0 +1,32 @@
+文档生成开始于: 2025-05-10 23:12:13
+输出目录: isaac_sim_docs_organized
+Python版本: 3.10.15 (tags/v3.10.15-dirty:ffee63f, Oct  8 2024, 18:53:10) [GCC 7.3.1 20180303 (Red Hat 7.3.1-5)]
+成功导入isaacsim模块
+生成分类文档: 核心API
+保存文档: isaac_sim_docs_organized/核心API.md
+生成分类文档: 机器人
+保存文档: isaac_sim_docs_organized/机器人.md
+生成分类文档: 传感器
+保存文档: isaac_sim_docs_organized/传感器.md
+生成分类文档: 控制器
+保存文档: isaac_sim_docs_organized/控制器.md
+生成分类文档: 材质与物理
+保存文档: isaac_sim_docs_organized/材质与物理.md
+生成分类文档: 对象与几何
+保存文档: isaac_sim_docs_organized/对象与几何.md
+生成分类文档: 场景与任务
+保存文档: isaac_sim_docs_organized/场景与任务.md
+生成分类文档: 导入工具
+保存文档: isaac_sim_docs_organized/导入工具.md
+生成分类文档: 机器人示例
+保存文档: isaac_sim_docs_organized/机器人示例.md
+生成分类文档: 仿真工具
+保存文档: isaac_sim_docs_organized/仿真工具.md
+生成分类文档: 运动规划
+保存文档: isaac_sim_docs_organized/运动规划.md
+生成分类文档: ROS2集成
+保存文档: isaac_sim_docs_organized/ROS2集成.md
+文档生成完成！耗时: 0.04 秒
+共生成 12 个分类文档
+主索引: isaac_sim_docs_organized/README.md
+快速参考: isaac_sim_docs_organized/quick_reference.md

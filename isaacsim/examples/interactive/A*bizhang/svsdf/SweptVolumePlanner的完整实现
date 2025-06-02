@@ -1,0 +1,749 @@
+#include "sweep_volume_planner.h"
+#include "minco_trajectory.h"
+#include "sdf_calculator.h"
+#include "mpc_controller.h"
+
+#include <iostream>
+#include <fstream>
+#include <chrono>
+#include <cmath>
+#include <algorithm>
+#include <queue>
+
+/**
+ * @brief SweptVolumePlanner的完整实现
+ * 
+ * 整合四个阶段的算法：
+ * 1. A*路径搜索
+ * 2. MINCO第一次优化（平滑化） 
+ * 3. MINCO第二次优化（扫掠体积最小化）
+ * 4. MPC实时跟踪控制
+ */
+
+// ========== 构造函数实现 ==========
+SweptVolumePlanner::SweptVolumePlanner(const RobotParams& params) 
+    : robot_params_(params) {
+    
+    // 初始化各个模块
+    SDFCalculator::RobotShape robot_shape;
+    robot_shape.length = params.length;
+    robot_shape.width = params.width;
+    
+    sdf_calc_ = std::make_unique<SDFCalculator>(robot_shape);
+    
+    MPCController::MPCParams mpc_params;
+    mpc_params.wheel_base = params.wheel_base;
+    mpc_params.max_linear_vel = params.max_vel;
+    mpc_params.max_angular_vel = params.max_omega;
+    mpc_params.max_linear_acc = params.max_acc;
+    mpc_params.prediction_horizon = N_p_;
+    mpc_params.control_horizon = N_c_;
+    mpc_params.sample_time = dt_;
+    
+    mpc_controller_ = std::make_unique<MPCController>(mpc_params);
+    
+    minco_traj_ = std::make_unique<MINCOTrajectory>(8);  // 8段轨迹
+    
+    std::cout << "扫掠体积感知轨迹规划器初始化完成\n";
+    std::cout << "机器人参数: L=" << params.length << "m, W=" << params.width << "m\n";
+    std::cout << "运动约束: v_max=" << params.max_vel << "m/s, ω_max=" << params.max_omega << "rad/s\n";
+}
+
+// ========== 主规划函数实现 ==========
+bool SweptVolumePlanner::planTrajectory(
+    const Eigen::VectorXd& start_state,
+    const Eigen::VectorXd& goal_state,
+    const std::vector<Obstacle>& obstacles,
+    std::vector<TrajectoryPoint>& trajectory) {
+    
+    std::cout << "\n=== 开始扫掠体积感知轨迹规划 ===\n";
+    auto total_start = std::chrono::high_resolution_clock::now();
+    
+    obstacles_ = obstacles;
+    
+    // ===== 第一阶段：A*初始路径生成 =====
+    std::cout << "第一阶段：A*初始路径生成...\n";
+    auto stage1_start = std::chrono::high_resolution_clock::now();
+    
+    Eigen::Vector2d start_pos = start_state.head<2>();
+    Eigen::Vector2d goal_pos = goal_state.head<2>();
+    
+    std::vector<Eigen::Vector2d> initial_path = generateInitialPath(start_pos, goal_pos);
+    
+    if (initial_path.empty()) {
+        std::cerr << "错误：A*路径搜索失败\n";
+        return false;
+    }
+    
+    auto stage1_end = std::chrono::high_resolution_clock::now();
+    auto stage1_time = std::chrono::duration_cast<std::chrono::milliseconds>(stage1_end - stage1_start).count();
+    std::cout << "A*路径生成完成，耗时: " << stage1_time << "ms，路径点数: " << initial_path.size() << "\n";
+    
+    // ===== 第二阶段：MINCO第一次优化（平滑化） =====
+    std::cout << "第二阶段：MINCO轨迹平滑化优化...\n";
+    auto stage2_start = std::chrono::high_resolution_clock::now();
+    
+    std::vector<TrajectoryPoint> stage1_trajectory = optimizeTrajectoryStage1(initial_path);
+    
+    if (stage1_trajectory.empty()) {
+        std::cerr << "错误：第一阶段轨迹优化失败\n";
+        return false;
+    }
+    
+    auto stage2_end = std::chrono::high_resolution_clock::now();
+    auto stage2_time = std::chrono::duration_cast<std::chrono::milliseconds>(stage2_end - stage2_start).count();
+    std::cout << "第一阶段优化完成，耗时: " << stage2_time << "ms\n";
+    
+    // ===== 第三阶段：MINCO第二次优化（扫掠体积最小化） =====
+    std::cout << "第三阶段：扫掠体积最小化优化...\n";
+    auto stage3_start = std::chrono::high_resolution_clock::now();
+    
+    std::vector<TrajectoryPoint> final_trajectory = optimizeTrajectoryStage2(stage1_trajectory);
+    
+    if (final_trajectory.empty()) {
+        std::cerr << "错误：第二阶段轨迹优化失败\n";
+        return false;
+    }
+    
+    auto stage3_end = std::chrono::high_resolution_clock::now();
+    auto stage3_time = std::chrono::duration_cast<std::chrono::milliseconds>(stage3_end - stage3_start).count();
+    std::cout << "第二阶段优化完成，耗时: " << stage3_time << "ms\n";
+    
+    // ===== 计算性能指标 =====
+    double swept_volume = computeSweptVolumeCost(final_trajectory);
+    double obstacle_cost = computeObstacleCost(final_trajectory);
+    double total_time = final_trajectory.back().time;
+    
+    auto total_end = std::chrono::high_resolution_clock::now();
+    auto total_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(total_end - total_start).count();
+    
+    std::cout << "\n=== 规划完成 ===\n";
+    std::cout << "总耗时: " << total_time_ms << "ms\n";
+    std::cout << "轨迹总时间: " << total_time << "s\n";
+    std::cout << "扫掠体积: " << swept_volume << "m²\n";
+    std::cout << "障碍物代价: " << obstacle_cost << "\n";
+    std::cout << "轨迹点数: " << final_trajectory.size() << "\n";
+    
+    trajectory = final_trajectory;
+    return true;
+}
+
+// ========== A*路径搜索实现 ==========
+std::vector<Eigen::Vector2d> SweptVolumePlanner::generateInitialPath(
+    const Eigen::Vector2d& start, 
+    const Eigen::Vector2d& goal) {
+    
+    /**
+     * A*算法实现
+     * 
+     * f(n) = g(n) + h(n)
+     * g(n): 从起点到节点n的实际代价
+     * h(n): 从节点n到终点的启发式代价（欧几里得距离）
+     */
+    
+    // 网格参数
+    const double grid_resolution = 0.1;  // 10cm分辨率
+    const double robot_radius = std::max(robot_params_.length, robot_params_.width) / 2.0 + 0.1;  // 安全半径
+    
+    // 计算网格边界
+    double x_min = std::min(start.x(), goal.x()) - 5.0;
+    double x_max = std::max(start.x(), goal.x()) + 5.0;
+    double y_min = std::min(start.y(), goal.y()) - 5.0;
+    double y_max = std::max(start.y(), goal.y()) + 5.0;
+    
+    int grid_width = static_cast<int>((x_max - x_min) / grid_resolution) + 1;
+    int grid_height = static_cast<int>((y_max - y_min) / grid_resolution) + 1;
+    
+    // 网格节点结构
+    struct Node {
+        int x, y;
+        double f, g, h;
+        Node* parent;
+        
+        Node(int x, int y) : x(x), y(y), f(0), g(0), h(0), parent(nullptr) {}
+        
+        bool operator>(const Node& other) const {
+            return f > other.f;
+        }
+    };
+    
+    // 坐标转换函数
+    auto worldToGrid = [&](const Eigen::Vector2d& pos) -> std::pair<int, int> {
+        int gx = static_cast<int>((pos.x() - x_min) / grid_resolution);
+        int gy = static_cast<int>((pos.y() - y_min) / grid_resolution);
+        return {std::max(0, std::min(grid_width-1, gx)), 
+                std::max(0, std::min(grid_height-1, gy))};
+    };
+    
+    auto gridToWorld = [&](int gx, int gy) -> Eigen::Vector2d {
+        return Eigen::Vector2d(x_min + gx * grid_resolution, 
+                              y_min + gy * grid_resolution);
+    };
+    
+    // 碰撞检测函数
+    auto isCollisionFree = [&](int gx, int gy) -> bool {
+        Eigen::Vector2d pos = gridToWorld(gx, gy);
+        
+        // 检查与障碍物的碰撞
+        for (const auto& obs : obstacles_) {
+            double dist = (pos - obs.center).norm();
+            if (dist < obs.radius + robot_radius) {
+                return false;
+            }
+        }
+        
+        return true;
+    };
+    
+    // 启发式函数（欧几里得距离）
+    auto heuristic = [&](int gx, int gy, int goal_x, int goal_y) -> double {
+        return std::sqrt((gx - goal_x) * (gx - goal_x) + (gy - goal_y) * (gy - goal_y)) * grid_resolution;
+    };
+    
+    // 起点和终点网格坐标
+    auto [start_gx, start_gy] = worldToGrid(start);
+    auto [goal_gx, goal_gy] = worldToGrid(goal);
+    
+    // 检查起点和终点是否有效
+    if (!isCollisionFree(start_gx, start_gy) || !isCollisionFree(goal_gx, goal_gy)) {
+        std::cerr << "起点或终点位于障碍物内\n";
+        return {};
+    }
+    
+    // A*搜索
+    std::priority_queue<Node*, std::vector<Node*>, std::greater<Node*>> open_list;
+    std::vector<std::vector<bool>> closed_list(grid_width, std::vector<bool>(grid_height, false));
+    std::vector<std::vector<std::unique_ptr<Node>>> all_nodes(grid_width, std::vector<std::unique_ptr<Node>>(grid_height));
+    
+    // 8邻域搜索方向
+    std::vector<std::pair<int, int>> directions = {
+        {-1, -1}, {-1, 0}, {-1, 1},
+        { 0, -1},          { 0, 1},
+        { 1, -1}, { 1, 0}, { 1, 1}
+    };
+    
+    // 初始化起点
+    all_nodes[start_gx][start_gy] = std::make_unique<Node>(start_gx, start_gy);
+    Node* start_node = all_nodes[start_gx][start_gy].get();
+    start_node->g = 0;
+    start_node->h = heuristic(start_gx, start_gy, goal_gx, goal_gy);
+    start_node->f = start_node->g + start_node->h;
+    
+    open_list.push(start_node);
+    
+    Node* goal_node = nullptr;
+    
+    while (!open_list.empty()) {
+        Node* current = open_list.top();
+        open_list.pop();
+        
+        int cx = current->x;
+        int cy = current->y;
+        
+        if (closed_list[cx][cy]) continue;
+        closed_list[cx][cy] = true;
+        
+        // 检查是否到达目标
+        if (cx == goal_gx && cy == goal_gy) {
+            goal_node = current;
+            break;
+        }
+        
+        // 扩展邻居节点
+        for (const auto& dir : directions) {
+            int nx = cx + dir.first;
+            int ny = cy + dir.second;
+            
+            // 边界检查
+            if (nx < 0 || nx >= grid_width || ny < 0 || ny >= grid_height) continue;
+            if (closed_list[nx][ny]) continue;
+            if (!isCollisionFree(nx, ny)) continue;
+            
+            // 计算移动代价
+            double move_cost = (dir.first == 0 || dir.second == 0) ? grid_resolution : grid_resolution * std::sqrt(2);
+            double tentative_g = current->g + move_cost;
+            
+            // 创建或更新邻居节点
+            if (!all_nodes[nx][ny]) {
+                all_nodes[nx][ny] = std::make_unique<Node>(nx, ny);
+            }
+            
+            Node* neighbor = all_nodes[nx][ny].get();
+            
+            if (neighbor->parent == nullptr || tentative_g < neighbor->g) {
+                neighbor->parent = current;
+                neighbor->g = tentative_g;
+                neighbor->h = heuristic(nx, ny, goal_gx, goal_gy);
+                neighbor->f = neighbor->g + neighbor->h;
+                
+                open_list.push(neighbor);
+            }
+        }
+    }
+    
+    // 重构路径
+    std::vector<Eigen::Vector2d> path;
+    if (goal_node) {
+        Node* current = goal_node;
+        while (current) {
+            Eigen::Vector2d pos = gridToWorld(current->x, current->y);
+            path.push_back(pos);
+            current = current->parent;
+        }
+        std::reverse(path.begin(), path.end());
+        
+        std::cout << "A*搜索成功，路径长度: " << path.size() << " 点\n";
+    } else {
+        std::cerr << "A*搜索失败，未找到可行路径\n";
+    }
+    
+    return path;
+}
+
+// ========== MINCO第一阶段优化实现 ==========
+std::vector<SweptVolumePlanner::TrajectoryPoint> SweptVolumePlanner::optimizeTrajectoryStage1(
+    const std::vector<Eigen::Vector2d>& initial_path) {
+    
+    if (initial_path.size() < 2) {
+        return {};
+    }
+    
+    // 构建3D路径点（添加航向角）
+    std::vector<Eigen::Vector3d> waypoints;
+    std::vector<double> initial_times;
+    
+    waypoints.reserve(initial_path.size());
+    initial_times.reserve(initial_path.size() - 1);
+    
+    for (size_t i = 0; i < initial_path.size(); ++i) {
+        Eigen::Vector3d waypoint;
+        waypoint.head<2>() = initial_path[i];
+        
+        // 计算航向角
+        if (i == 0) {
+            // 第一个点：指向下一个点
+            Eigen::Vector2d direction = initial_path[i+1] - initial_path[i];
+            waypoint(2) = std::atan2(direction.y(), direction.x());
+        } else if (i == initial_path.size() - 1) {
+            // 最后一个点：继承前一个点的方向
+            Eigen::Vector2d direction = initial_path[i] - initial_path[i-1];
+            waypoint(2) = std::atan2(direction.y(), direction.x());
+        } else {
+            // 中间点：平均方向
+            Eigen::Vector2d dir1 = initial_path[i] - initial_path[i-1];
+            Eigen::Vector2d dir2 = initial_path[i+1] - initial_path[i];
+            Eigen::Vector2d avg_dir = (dir1.normalized() + dir2.normalized()).normalized();
+            waypoint(2) = std::atan2(avg_dir.y(), avg_dir.x());
+        }
+        
+        waypoints.push_back(waypoint);
+        
+        // 计算段时间（基于距离和最大速度）
+        if (i < initial_path.size() - 1) {
+            double segment_length = (initial_path[i+1] - initial_path[i]).norm();
+            double segment_time = segment_length / (robot_params_.max_vel * 0.7);  // 70%最大速度
+            segment_time = std::max(0.5, segment_time);  // 最小0.5秒
+            initial_times.push_back(segment_time);
+        }
+    }
+    
+    // 初始化MINCO轨迹
+    try {
+        minco_traj_->initializeFromWaypoints(waypoints, initial_times);
+        
+        // 第一阶段优化：平滑化
+        bool success = minco_traj_->optimizeStage1(W_E_, W_T_, 100.0, waypoints);
+        
+        if (!success) {
+            std::cerr << "第一阶段MINCO优化失败\n";
+            return {};
+        }
+        
+        // 提取优化后的轨迹
+        std::vector<TrajectoryPoint> trajectory;
+        std::vector<Eigen::Vector3d> positions, velocities, accelerations;
+        std::vector<double> times;
+        
+        minco_traj_->getDiscretizedTrajectory(dt_, positions, velocities, accelerations, times);
+        
+        trajectory.reserve(positions.size());
+        for (size_t i = 0; i < positions.size(); ++i) {
+            TrajectoryPoint point;
+            point.position = positions[i];
+            point.velocity = velocities[i];
+            point.acceleration = accelerations[i];
+            point.time = times[i];
+            trajectory.push_back(point);
+        }
+        
+        std::cout << "第一阶段优化完成，轨迹点数: " << trajectory.size() << "\n";
+        return trajectory;
+        
+    } catch (const std::exception& e) {
+        std::cerr << "第一阶段优化异常: " << e.what() << "\n";
+        return {};
+    }
+}
+
+// ========== MINCO第二阶段优化实现 ==========
+std::vector<SweptVolumePlanner::TrajectoryPoint> SweptVolumePlanner::optimizeTrajectoryStage2(
+    const std::vector<TrajectoryPoint>& stage1_trajectory) {
+    
+    if (stage1_trajectory.empty()) {
+        return {};
+    }
+    
+    // 定义障碍物代价函数
+    auto obstacle_cost_func = [this](const Eigen::Vector3d& position, const Eigen::Vector3d& velocity) -> double {
+        double total_cost = 0.0;
+        
+        for (const auto& obs : obstacles_) {
+            double sdf = sdf_calc_->computeRobotSDF(position.head<2>(), position);
+            
+            // 如果在安全距离内，增加代价
+            const double safety_threshold = 0.3;  // 30cm安全距离
+            if (sdf < safety_threshold) {
+                double violation = safety_threshold - sdf;
+                total_cost += violation * violation * violation;  // 三次惩罚
+            }
+        }
+        
+        return total_cost;
+    };
+    
+    // 定义扫掠体积代价函数
+    auto swept_volume_cost_func = [this](const std::vector<MINCOTrajectory::TrajectorySegment>& segments) -> double {
+        // 将MINCO段转换为轨迹点
+        std::vector<Eigen::Vector4d> trajectory_points;
+        
+        double current_time = 0.0;
+        for (const auto& segment : segments) {
+            int num_samples = static_cast<int>(segment.duration / 0.05);  // 50ms采样
+            num_samples = std::max(5, num_samples);
+            
+            for (int i = 0; i <= num_samples; ++i) {
+                double t_local = (i * segment.duration) / num_samples;
+                
+                // 计算多项式值
+                Eigen::Vector4d point;
+                double t2 = t_local * t_local;
+                double t3 = t2 * t_local;
+                double t4 = t3 * t_local;
+                double t5 = t4 * t_local;
+                
+                point(0) = segment.coeffs_x(0) + segment.coeffs_x(1) * t_local + 
+                          segment.coeffs_x(2) * t2 + segment.coeffs_x(3) * t3 + 
+                          segment.coeffs_x(4) * t4 + segment.coeffs_x(5) * t5;
+                          
+                point(1) = segment.coeffs_y(0) + segment.coeffs_y(1) * t_local + 
+                          segment.coeffs_y(2) * t2 + segment.coeffs_y(3) * t3 + 
+                          segment.coeffs_y(4) * t4 + segment.coeffs_y(5) * t5;
+                          
+                point(2) = segment.coeffs_yaw(0) + segment.coeffs_yaw(1) * t_local + 
+                          segment.coeffs_yaw(2) * t2 + segment.coeffs_yaw(3) * t3 + 
+                          segment.coeffs_yaw(4) * t4 + segment.coeffs_yaw(5) * t5;
+                          
+                point(3) = current_time + t_local;
+                
+                trajectory_points.push_back(point);
+            }
+            
+            current_time += segment.duration;
+        }
+        
+        // 计算扫掠体积
+        return sdf_calc_->computeSweptVolume(trajectory_points);
+    };
+    
+    try {
+        // 第二阶段优化：扫掠体积最小化
+        bool success = minco_traj_->optimizeStage2(
+            W_E_, W_T_, W_ob_, W_sv_,
+            obstacle_cost_func,
+            swept_volume_cost_func
+        );
+        
+        if (!success) {
+            std::cerr << "第二阶段MINCO优化失败\n";
+            // 返回第一阶段结果作为后备
+            return stage1_trajectory;
+        }
+        
+        // 提取最终优化轨迹
+        std::vector<TrajectoryPoint> final_trajectory;
+        std::vector<Eigen::Vector3d> positions, velocities, accelerations;
+        std::vector<double> times;
+        
+        minco_traj_->getDiscretizedTrajectory(dt_, positions, velocities, accelerations, times);
+        
+        final_trajectory.reserve(positions.size());
+        for (size_t i = 0; i < positions.size(); ++i) {
+            TrajectoryPoint point;
+            point.position = positions[i];
+            point.velocity = velocities[i];
+            point.acceleration = accelerations[i];
+            point.time = times[i];
+            final_trajectory.push_back(point);
+        }
+        
+        std::cout << "第二阶段优化完成，最终轨迹点数: " << final_trajectory.size() << "\n";
+        return final_trajectory;
+        
+    } catch (const std::exception& e) {
+        std::cerr << "第二阶段优化异常: " << e.what() << "\n";
+        return stage1_trajectory;  // 返回第一阶段结果
+    }
+}
+
+// ========== MPC控制实现 ==========
+SweptVolumePlanner::ControlInput SweptVolumePlanner::computeMPCControl(
+    const Eigen::VectorXd& current_state,
+    const std::vector<TrajectoryPoint>& reference_trajectory,
+    double current_time) {
+    
+    if (reference_trajectory.empty()) {
+        ControlInput zero_control;
+        zero_control.linear_vel = 0.0;
+        zero_control.angular_vel = 0.0;
+        zero_control.v_left = 0.0;
+        zero_control.v_right = 0.0;
+        return zero_control;
+    }
+    
+    // 转换当前状态
+    MPCController::State mpc_state;
+    mpc_state.x = current_state(0);
+    mpc_state.y = current_state(1);
+    mpc_state.theta = current_state(2);
+    mpc_state.v = (current_state.size() > 3) ? current_state(3) : 0.0;
+    mpc_state.omega = (current_state.size() > 4) ? current_state(4) : 0.0;
+    
+    // 转换参考轨迹
+    std::vector<MPCController::State> ref_states;
+    std::vector<double> ref_times;
+    
+    ref_states.reserve(reference_trajectory.size());
+    ref_times.reserve(reference_trajectory.size());
+    
+    for (const auto& point : reference_trajectory) {
+        MPCController::State ref_state;
+        ref_state.x = point.position(0);
+        ref_state.y = point.position(1);
+        ref_state.theta = point.position(2);
+        ref_state.v = point.velocity.head<2>().norm();
+        ref_state.omega = point.velocity(2);
+        
+        ref_states.push_back(ref_state);
+        ref_times.push_back(point.time);
+    }
+    
+    // 计算MPC控制
+    MPCController::Control mpc_control = mpc_controller_->computeControl(
+        mpc_state, ref_states, ref_times, current_time
+    );
+    
+    // 转换输出格式
+    ControlInput control_input;
+    control_input.linear_vel = mpc_control.linear_vel;
+    control_input.angular_vel = mpc_control.angular_vel;
+    control_input.v_left = mpc_control.v_left;
+    control_input.v_right = mpc_control.v_right;
+    
+    return control_input;
+}
+
+// ========== 辅助函数实现 ==========
+double SweptVolumePlanner::computeSweptVolumeCost(const std::vector<TrajectoryPoint>& trajectory) {
+    if (trajectory.empty()) return 0.0;
+    
+    // 转换轨迹格式
+    std::vector<Eigen::Vector4d> traj_points;
+    for (const auto& point : trajectory) {
+        Eigen::Vector4d p;
+        p.head<3>() = point.position;
+        p(3) = point.time;
+        traj_points.push_back(p);
+    }
+    
+    return sdf_calc_->computeSweptVolume(traj_points);
+}
+
+double SweptVolumePlanner::computeObstacleCost(const std::vector<TrajectoryPoint>& trajectory) {
+    double total_cost = 0.0;
+    
+    for (const auto& point : trajectory) {
+        for (const auto& obs : obstacles_) {
+            double dist = (point.position.head<2>() - obs.center).norm();
+            double clearance = dist - obs.radius - robot_params_.width / 2.0;
+            
+            if (clearance < 0.5) {  // 50cm安全距离
+                double violation = 0.5 - clearance;
+                total_cost += violation * violation;
+            }
+        }
+    }
+    
+    return total_cost;
+}
+
+double SweptVolumePlanner::computeSDF(const Eigen::Vector2d& point, const Eigen::Vector3d& robot_state) {
+    return sdf_calc_->computeRobotSDF(point, robot_state);
+}
+
+// ========== 参数设置函数 ==========
+void SweptVolumePlanner::setOptimizationParams(double weight_energy, double weight_time, 
+                                              double weight_obstacle, double weight_swept_volume) {
+    W_E_ = weight_energy;
+    W_T_ = weight_time;
+    W_ob_ = weight_obstacle;
+    W_sv_ = weight_swept_volume;
+    
+    std::cout << "优化权重已更新: W_E=" << W_E_ << ", W_T=" << W_T_ 
+              << ", W_ob=" << W_ob_ << ", W_sv=" << W_sv_ << "\n";
+}
+
+void SweptVolumePlanner::setMPCParams(int prediction_horizon, int control_horizon, double sample_time) {
+    N_p_ = prediction_horizon;
+    N_c_ = control_horizon;
+    dt_ = sample_time;
+    
+    // 更新MPC控制器参数
+    if (mpc_controller_) {
+        MPCController::MPCParams mpc_params;
+        mpc_params.prediction_horizon = N_p_;
+        mpc_params.control_horizon = N_c_;
+        mpc_params.sample_time = dt_;
+        mpc_params.wheel_base = robot_params_.wheel_base;
+        mpc_params.max_linear_vel = robot_params_.max_vel;
+        mpc_params.max_angular_vel = robot_params_.max_omega;
+        mpc_params.max_linear_acc = robot_params_.max_acc;
+        
+        mpc_controller_->updateParams(mpc_params);
+    }
+    
+    std::cout << "MPC参数已更新: N_p=" << N_p_ << ", N_c=" << N_c_ << ", dt=" << dt_ << "\n";
+}
+
+// ========== 使用示例主函数 ==========
+int main() {
+    std::cout << "=== 扫掠体积感知轨迹规划系统演示 ===\n\n";
+    
+    // 1. 初始化机器人参数
+    SweptVolumePlanner::RobotParams robot_params;
+    robot_params.length = 0.6;      // 60cm长
+    robot_params.width = 0.4;       // 40cm宽
+    robot_params.max_vel = 1.0;     // 最大1m/s
+    robot_params.max_omega = 1.5;   // 最大1.5rad/s
+    robot_params.max_acc = 2.0;     // 最大2m/s²
+    robot_params.wheel_base = 0.3;  // 轮距30cm
+    
+    // 2. 创建规划器
+    SweptVolumePlanner planner(robot_params);
+    
+    // 3. 设置优化权重
+    planner.setOptimizationParams(1.0,     // 能量权重
+                                 1.0,     // 时间权重
+                                 10000.0, // 障碍物权重
+                                 1000.0); // 扫掠体积权重
+    
+    // 4. 设置MPC参数
+    planner.setMPCParams(20,   // 预测时域
+                        10,   // 控制时域
+                        0.1); // 采样时间
+    
+    // 5. 定义起点和终点
+    Eigen::VectorXd start_state(6);
+    start_state << 0.0, 0.0, 0.0, 0.0, 0.0, 0.0;  // [x, y, θ, vx, vy, ω]
+    
+    Eigen::VectorXd goal_state(6);
+    goal_state << 5.0, 3.0, M_PI/4, 0.0, 0.0, 0.0;
+    
+    // 6. 定义障碍物
+    std::vector<SweptVolumePlanner::Obstacle> obstacles;
+    
+    SweptVolumePlanner::Obstacle obs1;
+    obs1.center = Eigen::Vector2d(2.0, 1.0);
+    obs1.radius = 0.5;
+    obstacles.push_back(obs1);
+    
+    SweptVolumePlanner::Obstacle obs2;
+    obs2.center = Eigen::Vector2d(3.5, 2.0);
+    obs2.radius = 0.3;
+    obstacles.push_back(obs2);
+    
+    std::cout << "障碍物数量: " << obstacles.size() << "\n";
+    
+    // 7. 执行轨迹规划
+    std::vector<SweptVolumePlanner::TrajectoryPoint> trajectory;
+    bool success = planner.planTrajectory(start_state, goal_state, obstacles, trajectory);
+    
+    if (!success) {
+        std::cerr << "轨迹规划失败！\n";
+        return -1;
+    }
+    
+    // 8. 保存轨迹结果
+    std::ofstream file("trajectory_result.csv");
+    file << "time,x,y,theta,vx,vy,omega,ax,ay,alpha\n";
+    
+    for (const auto& point : trajectory) {
+        file << point.time << ","
+             << point.position(0) << "," << point.position(1) << "," << point.position(2) << ","
+             << point.velocity(0) << "," << point.velocity(1) << "," << point.velocity(2) << ","
+             << point.acceleration(0) << "," << point.acceleration(1) << "," << point.acceleration(2) << "\n";
+    }
+    file.close();
+    std::cout << "轨迹已保存到 trajectory_result.csv\n";
+    
+    // 9. MPC跟踪控制演示
+    std::cout << "\n=== MPC跟踪控制演示 ===\n";
+    
+    Eigen::VectorXd current_state = start_state;
+    double sim_time = 0.0;
+    double sim_dt = 0.1;
+    
+    std::ofstream control_file("mpc_control.csv");
+    control_file << "time,x,y,theta,v_linear,v_angular,v_left,v_right\n";
+    
+    for (int step = 0; step < 100 && sim_time < trajectory.back().time; ++step) {
+        // 计算MPC控制
+        auto control = planner.computeMPCControl(current_state, trajectory, sim_time);
+        
+        // 简化的机器人动力学仿真
+        double v = control.linear_vel;
+        double omega = control.angular_vel;
+        
+        current_state(0) += sim_dt * v * std::cos(current_state(2));  // x
+        current_state(1) += sim_dt * v * std::sin(current_state(2));  // y
+        current_state(2) += sim_dt * omega;                           // theta
+        current_state(3) = v;                                         // vx (简化)
+        current_state(4) = 0.0;                                       // vy
+        current_state(5) = omega;                                     // omega
+        
+        // 角度归一化
+        while (current_state(2) > M_PI) current_state(2) -= 2 * M_PI;
+        while (current_state(2) < -M_PI) current_state(2) += 2 * M_PI;
+        
+        // 记录控制结果
+        control_file << sim_time << ","
+                    << current_state(0) << "," << current_state(1) << "," << current_state(2) << ","
+                    << control.linear_vel << "," << control.angular_vel << ","
+                    << control.v_left << "," << control.v_right << "\n";
+        
+        sim_time += sim_dt;
+        
+        if (step % 10 == 0) {
+            std::cout << "时间: " << sim_time << "s, 位置: (" 
+                     << current_state(0) << ", " << current_state(1) << ")\n";
+        }
+    }
+    
+    control_file.close();
+    std::cout << "MPC控制结果已保存到 mpc_control.csv\n";
+    
+    std::cout << "\n=== 演示完成 ===\n";
+    std::cout << "请使用Python脚本可视化结果：\n";
+    std::cout << "python3 visualize_trajectory.py\n";
+    
+    return 0;
+}

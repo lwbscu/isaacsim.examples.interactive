@@ -1,0 +1,16 @@
+svsdf_project/
+├── core/
+│   ├── astar_planner.py
+│   ├── minco_trajectory.py
+│   ├── sdf_calculator.py
+│   ├── mpc_controller.py
+│   ├── swept_volume_analyzer.py
+│   └── svsdf_planner.py
+├── robot/
+│   └── differential_robot.py
+├── visualization/
+│   └── isaac_sim_visualizer.py
+├── utils/
+│   ├── config.py
+│   └── math_utils.py
+└── svsdf_isaac_sim_demo.py
