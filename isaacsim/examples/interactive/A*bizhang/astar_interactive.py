@@ -489,12 +489,12 @@ class InteractiveAvoidanceRobot:
                 point = self.current_path[i]
                 marker_path = f"/World/path_marker_{i}"
                 
-                # 使用FixedCuboid创建路径标记
+                # 使用FixedCuboid创建路径标记，提高高度到3
                 path_marker = self.world.scene.add(
                     FixedCuboid(
                         prim_path=marker_path,
                         name=f"path_marker_{i}",
-                        position=np.array([point[0], point[1], 0.05]),
+                        position=np.array([point[0], point[1], 3.0]),  # 高度提高到3
                         scale=np.array([0.15, 0.15, 0.15]),
                         color=np.array([0.0, 1.0, 0.0])  # 绿色
                     )
