@@ -4,18 +4,44 @@
 集成Isaac Sim物理仿真
 """
 import numpy as np
-from typing import Tuple, Optional
-import omni
-from isaacsim.core.api.objects import DynamicCuboid
-from isaacsim.core.api.materials import PreviewSurface, PhysicsMaterial
-from isaacsim.robot.wheeled_robots import DifferentialController
+from typing import Tuple, Optional, List
+import warnings
+
+# 尝试导入Isaac Sim模块，如果不可用则使用模拟版本
+try:
+    import omni
+    from isaacsim.core.api.objects import DynamicCuboid
+    from isaacsim.core.api.materials import PreviewSurface, PhysicsMaterial
+    from isaacsim.robot.wheeled_robots import DifferentialController
+    ISAAC_SIM_AVAILABLE = True
+except ImportError:
+    warnings.warn("Isaac Sim modules not available, using mock implementations")
+    ISAAC_SIM_AVAILABLE = False
+    
+    # Mock classes for standalone testing
+    class DynamicCuboid:
+        def __init__(self, *args, **kwargs):
+            pass
+    
+    class PreviewSurface:
+        def __init__(self, *args, **kwargs):
+            pass
+    
+    class PhysicsMaterial:
+        def __init__(self, *args, **kwargs):
+            pass
+    
+    class DifferentialController:
+        def __init__(self, *args, **kwargs):
+            pass
+
 from utils.config import config
 from core.mpc_controller import MPCState, MPCControl
 
 class DifferentialRobot:
     """
     差分驱动机器人模型
-    基于Isaac Sim的物理仿真
+    基于Isaac Sim的物理仿真，支持独立运行模式
     """
     
     def __init__(self, prim_path: str = "/World/Robot", name: str = "differential_robot"):
@@ -28,6 +54,77 @@ class DifferentialRobot:
         self.height = config.robot.height
         self.wheel_base = config.robot.wheel_base
         self.wheel_radius = config.robot.wheel_radius
+        
+        # 物理参数
+        self.mass = config.robot.mass
+        self.max_linear_vel = config.robot.max_linear_vel
+        self.max_angular_vel = config.robot.max_angular_vel
+        
+        # 状态变量
+        self.current_state = MPCState()
+        self.current_state.x = 0.0
+        self.current_state.y = 0.0
+        self.current_state.theta = 0.0
+        self.current_state.v = 0.0
+        self.current_state.omega = 0.0
+        
+        # Isaac Sim相关
+        self.robot_prim = None
+        self.controller = None
+        self.is_initialized = False
+        
+        if ISAAC_SIM_AVAILABLE:
+            self._initialize_isaac_sim()
+        else:
+            print("Running in standalone mode without Isaac Sim")
+            self.is_initialized = True
+    
+    def _initialize_isaac_sim(self):
+        """初始化Isaac Sim组件"""
+        try:
+            # 创建机器人几何体
+            self.robot_prim = DynamicCuboid(
+                prim_path=self.prim_path,
+                name=self.name,
+                size=np.array([self.length, self.width, self.height]),
+                color=np.array([0.2, 0.5, 0.8]),
+                mass=self.mass
+            )
+            
+            # 应用材质
+            robot_material = PreviewSurface(
+                prim_path=f"{self.prim_path}/material",
+                name="robot_material"
+            )
+            robot_material.set_color(color=np.array([0.2, 0.5, 0.8]))
+            robot_material.set_roughness(0.4)
+            robot_material.set_metallic(0.0)
+            self.robot_prim.apply_visual_material(robot_material)
+            
+            # 物理材质
+            physics_material = PhysicsMaterial(
+                prim_path=f"{self.prim_path}/physics_material",
+                name="robot_physics"
+            )
+            physics_material.set_static_friction(0.5)
+            physics_material.set_dynamic_friction(0.5)
+            physics_material.set_restitution(0.0)
+            self.robot_prim.apply_physics_material(physics_material)
+            
+            # 差分驱动控制器
+            self.controller = DifferentialController(
+                name="diff_controller",
+                wheel_radius=self.wheel_radius,
+                wheel_base=self.wheel_base
+            )
+            
+            self.is_initialized = True
+            print(f"机器人 '{self.name}' 在Isaac Sim中初始化成功")
+            
+        except Exception as e:
+            print(f"Isaac Sim初始化失败: {e}")
+            print("切换到独立运行模式")
+            self.is_initialized = True
         
         # Isaac Sim组件
         self.robot_prim: Optional[DynamicCuboid] = None

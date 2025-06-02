@@ -6,14 +6,29 @@ Isaac Sim集成可视化器
 import numpy as np
 from typing import List, Dict, Optional, Tuple
 import asyncio
-import omni
-from omni.isaac.core.materials import PreviewSurface, OmniPBR
-from omni.isaac.core.objects import VisualCuboid, VisualSphere, VisualCylinder
-from omni.isaac.core.prims import GeometryPrim
-from omni.isaac.core.utils.prims import create_prim, get_prim_at_path
-from isaacsim.core.api.objects import DynamicSphere, FixedCuboid
-from pxr import Usd, UsdGeom, Gf, UsdShade
-import carb
+import warnings
+
+# 尝试导入Isaac Sim模块，如果不可用则使用模拟版本
+try:
+    import omni
+    from omni.isaac.core.materials import PreviewSurface, OmniPBR
+    from omni.isaac.core.objects import VisualCuboid, VisualSphere, VisualCylinder
+    from omni.isaac.core.prims import GeometryPrim
+    from omni.isaac.core.utils.prims import create_prim, get_prim_at_path
+    from isaacsim.core.api.objects import DynamicSphere, FixedCuboid
+    from pxr import Usd, UsdGeom, Gf, UsdShade
+    import carb
+    ISAAC_SIM_AVAILABLE = True
+except ImportError:
+    warnings.warn("Isaac Sim modules not available, using mock implementations")
+    ISAAC_SIM_AVAILABLE = False
+    
+    # Mock classes for standalone testing
+    class MockStage:
+        pass
+    
+    class MockPrim:
+        pass
 
 from utils.config import config
 from utils.math_utils import MathUtils
@@ -24,7 +39,15 @@ class IsaacSimVisualizer:
     提供美观的轨迹、扫掠体积和机器人状态可视化
     """
     
-    def __init__(self, stage):
+    def __init__(self, stage=None):
+        if not ISAAC_SIM_AVAILABLE:
+            print("Isaac Sim not available, visualizer running in mock mode")
+            self.stage = MockStage()
+            self.visualization_prims = {}
+            self.materials = {}
+            self.animation_timers = {}
+            return
+            
         self.stage = stage
         self.visualization_prims = {}
         self.materials = {}
