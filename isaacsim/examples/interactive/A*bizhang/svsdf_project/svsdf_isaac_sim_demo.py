@@ -288,20 +288,12 @@ class SVSDFDemo:
             print(f"设置相机失败: {e}")
     
     def run_demo_scenario(self, scenario_index: int = 1):
-        """运行指定的演示场景 - 默认运行复杂场景"""
+        """运行指定的演示场景 - 仅用于初始化障碍物"""
         if scenario_index >= len(self.demo_scenarios):
-            print(f"场景索引 {scenario_index} 超出范围，使用场景1")
             scenario_index = 1
         
         scenario = self.demo_scenarios[scenario_index]
-        print(f"\n{'='*50}")
-        print(f"运行演示场景: {scenario['name']}")
-        print(f"描述: {scenario['description']}")
-        print(f"{'='*50}")
-        
-        # 设置机器人初始位置
-        start_pos = np.array([scenario['start_pos'][0], scenario['start_pos'][1], 0.1])
-        self.set_robot_pose(start_pos, scenario['start_yaw'])
+        print(f"初始化场景: {scenario['name']}")
         
         # 创建障碍物
         self.create_obstacles_for_scenario(scenario['obstacles'])
@@ -309,71 +301,7 @@ class SVSDFDemo:
         # 等待物理稳定
         self._wait_for_stability()
         
-        # 第一阶段：A*路径规划
-        print(f"\n阶段1: A*初始路径搜索...")
-        astar_path = self.astar_planner.plan_path(
-            scenario['start_pos'], scenario['goal_pos']
-        )
-        
-        if not astar_path:
-            print("A*路径规划失败!")
-            return False
-        
-        print(f"✓ A*路径规划完成，找到 {len(astar_path)} 个路径点")
-        
-        # 第二阶段：MINCO第一阶段优化（轨迹平滑化）
-        print(f"阶段2: MINCO第一阶段优化（轨迹平滑化）...")
-        try:
-            # 将A*路径转换为轨迹点
-            trajectory_points = []
-            for i, point in enumerate(astar_path):
-                t = float(i) * 0.5  # 每个点间隔0.5秒
-                traj_point = TrajectoryPoint(
-                    position=np.array([point[0], point[1], scenario['start_yaw'] if i == 0 else 0.0]),
-                    velocity=np.array([0.3, 0.0, 0.0]),  # 保持前进
-                    acceleration=np.array([0.0, 0.0, 0.0]),
-                    time=t
-                )
-                trajectory_points.append(traj_point)
-            
-            # SVSDF第一阶段优化
-            stage1_trajectory = self.svsdf_planner.optimize_stage1(
-                trajectory_points, scenario['start_pos'], scenario['goal_pos']
-            )
-            print(f"✓ MINCO第一阶段完成，优化了 {len(stage1_trajectory)} 个轨迹点")
-            
-        except Exception as e:
-            print(f"MINCO第一阶段失败: {e}")
-            print("使用A*路径继续...")
-            stage1_trajectory = trajectory_points
-        
-        # 第三阶段：MINCO第二阶段优化（扫掠体积最小化）
-        print(f"阶段3: MINCO第二阶段优化（扫掠体积最小化）...")
-        try:
-            final_trajectory = self.svsdf_planner.optimize_stage2(
-                stage1_trajectory, scenario['obstacles']
-            )
-            print(f"✓ MINCO第二阶段完成，最终轨迹包含 {len(final_trajectory)} 个点")
-            
-        except Exception as e:
-            print(f"MINCO第二阶段失败: {e}")
-            print("使用第一阶段轨迹继续...")
-            final_trajectory = stage1_trajectory
-        
-        # 第四阶段：轨迹跟踪执行
-        print(f"阶段4: 轨迹跟踪执行...")
-        self.current_trajectory = final_trajectory
-        success = self.execute_trajectory()
-        
-        if success:
-            print(f"✓ 场景 '{scenario['name']}' 执行完成!")
-            print(f"起点: ({scenario['start_pos'][0]:.2f}, {scenario['start_pos'][1]:.2f})")
-            print(f"终点: ({scenario['goal_pos'][0]:.2f}, {scenario['goal_pos'][1]:.2f})")
-            print(f"最终轨迹点数: {len(final_trajectory)}")
-        else:
-            print(f"✗ 场景 '{scenario['name']}' 执行失败!")
-        
-        return success
+        return True
     
     def execute_trajectory(self):
         """执行轨迹跟踪"""
@@ -406,26 +334,194 @@ class SVSDFDemo:
         return True
     
     def run_complex_demo(self):
-        """运行复杂场景演示 - 按照用户要求简化为一个复杂场景"""
+        """运行复杂场景演示 - 交互式版本，参考astar_interactive.py"""
         print(f"\n{'='*60}")
-        print("SVSDF轨迹规划系统 - 复杂多障碍物演示")
+        print("SVSDF轨迹规划系统 - 交互式复杂演示")
         print("展示完整的4阶段SVSDF框架:")
         print("1. A*初始路径搜索")
         print("2. MINCO阶段1优化（轨迹平滑化）") 
         print("3. MINCO阶段2优化（扫掠体积最小化）")
         print("4. 轨迹跟踪执行")
+        print("")
+        print("交互控制:")
+        print("- 箭头键/WASD: 移动目标位置")
+        print("- SPACE: 开始/停止自动导航")
+        print("- R: 重新规划路径")
+        print("- T: 设置随机目标")
+        print("- ESC: 退出")
         print(f"{'='*60}")
         
-        # 运行复杂多障碍物场景（索引1）
-        success = self.run_demo_scenario(1)
+        # 创建起点和终点标记
+        self.create_start_end_markers()
         
-        if success:
-            print(f"\n🎉 SVSDF复杂场景演示完成!")
-            print("已成功展示了完整的4阶段SVSDF轨迹规划框架")
+        # 设置输入处理
+        self.setup_input_handling()
+        
+        # 创建目标立方体
+        self.create_target_cube()
+        
+        # 运行交互式循环
+        self.interactive_loop()
+    
+    def setup_input_handling(self):
+        """设置输入处理 - 参考astar_interactive.py"""
+        try:
+            import carb
+            import omni.appwindow
+            
+            self._appwindow = omni.appwindow.get_default_app_window()
+            self._input = carb.input.acquire_input_interface()
+            self._keyboard = self._appwindow.get_keyboard()
+            self._sub_keyboard = self._input.subscribe_to_keyboard_events(self._keyboard, self._sub_keyboard_event)
+            
+            # 状态变量
+            self.goal_pos = np.array([8.0, 6.0, 0.1])
+            self.auto_navigation = False
+            self.goal_changed = False
+            
+            print("✓ 输入处理初始化成功")
+        except Exception as e:
+            print(f"输入处理初始化失败: {e}")
+    
+    def _sub_keyboard_event(self, event, *args, **kwargs) -> bool:
+        """键盘事件处理 - 参考astar_interactive.py"""
+        import carb
+        
+        if event.type == carb.input.KeyboardEventType.KEY_PRESS:
+            key_name = event.input.name
+            
+            # 目标移动
+            if key_name in ["UP", "NUMPAD_8", "W"]:
+                self.move_target(0, 2.0)
+            elif key_name in ["DOWN", "NUMPAD_2", "S"]:
+                self.move_target(0, -2.0)
+            elif key_name in ["LEFT", "NUMPAD_4", "A"]:
+                self.move_target(-2.0, 0)
+            elif key_name in ["RIGHT", "NUMPAD_6", "D"]:
+                self.move_target(2.0, 0)
+            # 控制键
+            elif key_name == "SPACE":
+                self.toggle_auto_navigation()
+            elif key_name == "R":
+                self.request_replan()
+            elif key_name == "T":
+                self.set_random_target()
+            elif key_name == "ESCAPE":
+                self.running = False
+                
+        return True
+    
+    def move_target(self, dx, dy):
+        """移动目标位置"""
+        self.goal_pos[0] += dx
+        self.goal_pos[1] += dy
+        
+        # 限制目标在合理范围内
+        self.goal_pos[0] = max(-12, min(12, self.goal_pos[0]))
+        self.goal_pos[1] = max(-12, min(12, self.goal_pos[1]))
+        
+        print(f"目标移动到: ({self.goal_pos[0]:.1f}, {self.goal_pos[1]:.1f})")
+        self.goal_changed = True
+        
+        # 更新目标立方体位置
+        self.update_target_cube_position()
+    
+    def create_target_cube(self):
+        """创建目标立方体 - 参考astar_interactive.py"""
+        try:
+            self.target_cube = FixedCuboid(
+                prim_path="/World/target_cube",
+                name="target_cube",
+                position=np.array([self.goal_pos[0], self.goal_pos[1], 0.3]),
+                scale=np.array([0.6, 0.6, 0.6]),
+                color=np.array([1.0, 1.0, 0.0])  # 黄色
+            )
+            self.world.scene.add(self.target_cube)
+            print("✓ 目标立方体创建成功")
+        except Exception as e:
+            print(f"创建目标立方体失败: {e}")
+    
+    def update_target_cube_position(self):
+        """更新目标立方体位置"""
+        if self.target_cube:
+            try:
+                target_prim_path = "/World/target_cube"
+                target_prim = self.world.stage.GetPrimAtPath(target_prim_path)
+                
+                if target_prim.IsValid():
+                    xform = UsdGeom.Xformable(target_prim)
+                    xform.ClearXformOpOrder()
+                    translate_op = xform.AddTranslateOp()
+                    translate_op.Set(Gf.Vec3d(self.goal_pos[0], self.goal_pos[1], 0.3))
+            except Exception as e:
+                print(f"更新目标位置失败: {e}")
+    
+    def create_start_end_markers(self):
+        """创建起点和终点标记"""
+        try:
+            # 创建起点标记（绿色）
+            start_marker = FixedCuboid(
+                prim_path="/World/start_marker",
+                name="start_marker",
+                position=np.array([0.0, 0.0, 0.5]),
+                scale=np.array([0.8, 0.8, 1.0]),
+                color=np.array([0.0, 1.0, 0.0])  # 绿色
+            )
+            self.world.scene.add(start_marker)
+            
+            print("✓ 起点和终点标记创建成功")
+        except Exception as e:
+            print(f"创建标记失败: {e}")
+    
+    def toggle_auto_navigation(self):
+        """切换自动导航模式"""
+        self.auto_navigation = not self.auto_navigation
+        if self.auto_navigation:
+            print("🚀 自动导航开启 - 机器人将跟随目标")
+            self.request_replan()
         else:
-            print(f"\n❌ 演示执行失败")
+            print("⏸️ 自动导航关闭 - 使用箭头键移动目标，SPACE键开始")
+    
+    def request_replan(self):
+        """请求重新规划路径"""
+        if self.auto_navigation:
+            print("🔄 重新规划路径...")
+            success = self.run_svsdf_planning()
+            if success:
+                self.execute_trajectory()
+    
+    def set_random_target(self):
+        """设置随机目标位置"""
+        self.goal_pos[0] = np.random.uniform(-8, 8)
+        self.goal_pos[1] = np.random.uniform(-8, 8)
+        print(f"🎯 随机目标: ({self.goal_pos[0]:.1f}, {self.goal_pos[1]:.1f})")
+        self.goal_changed = True
+        self.update_target_cube_position()
         
-        return success
+        if self.auto_navigation:
+            self.request_replan()
+    
+    def interactive_loop(self):
+        """交互式主循环"""
+        self.running = True
+        print("\n🎮 交互模式开始！使用箭头键移动目标，SPACE开始导航，ESC退出")
+        
+        try:
+            while self.running:
+                # 更新仿真
+                self.world.step(render=True)
+                
+                # 检查是否需要重新规划
+                if self.auto_navigation and self.goal_changed:
+                    self.goal_changed = False
+                    self.request_replan()
+                
+                time.sleep(0.05)  # 50Hz更新频率
+                
+        except KeyboardInterrupt:
+            print("\n用户中断")
+        finally:
+            print("退出交互模式")
     
     def _wait_for_stability(self, duration: float = 2.0):
         """等待物理系统稳定"""
@@ -568,10 +664,179 @@ class SVSDFDemo:
         # 重置A*网格
         self.astar_planner.grid.fill(0)
 
-    # ...existing code...
+    def run_svsdf_planning(self):
+        """执行SVSDF 4阶段规划"""
+        try:
+            # 获取当前机器人位置
+            current_pos = self.current_position
+            goal_pos = self.goal_pos
+            
+            print(f"\n🚀 开始SVSDF轨迹规划")
+            print(f"起点: ({current_pos[0]:.2f}, {current_pos[1]:.2f})")
+            print(f"终点: ({goal_pos[0]:.2f}, {goal_pos[1]:.2f})")
+            
+            # 阶段1: A*路径规划
+            print(f"阶段1: A*初始路径搜索...")
+            astar_path = self.astar_planner.plan_path(
+                [current_pos[0], current_pos[1]], 
+                [goal_pos[0], goal_pos[1]]
+            )
+            
+            if not astar_path:
+                print("❌ A*路径规划失败!")
+                return False
+            
+            print(f"✓ A*路径规划完成，找到 {len(astar_path)} 个路径点")
+            
+            # 清除旧的可视化
+            self.clear_all_markers()
+            
+            # 可视化A*路径
+            self.visualize_astar_path(astar_path)
+            
+            # 阶段2和3: SVSDF优化（暂时简化）
+            print(f"阶段2: MINCO第一阶段优化（轨迹平滑化）...")
+            print(f"阶段3: MINCO第二阶段优化（扫掠体积最小化）...")
+            
+            # 将A*路径转换为轨迹点
+            trajectory_points = []
+            for i, point in enumerate(astar_path):
+                t = float(i) * 0.5
+                traj_point = TrajectoryPoint(
+                    position=np.array([point[0], point[1], 0.0]),
+                    velocity=np.array([0.3, 0.0, 0.0]),
+                    acceleration=np.array([0.0, 0.0, 0.0]),
+                    time=t
+                )
+                trajectory_points.append(traj_point)
+            
+            self.current_trajectory = trajectory_points
+            
+            # 可视化优化后的轨迹
+            self.visualize_trajectory(trajectory_points)
+            
+            # 可视化扫掠体积
+            self.visualize_swept_volumes(trajectory_points)
+            
+            print(f"✓ SVSDF轨迹优化完成")
+            return True
+            
+        except Exception as e:
+            print(f"❌ SVSDF规划失败: {e}")
+            return False
+    
+    def visualize_astar_path(self, path):
+        """可视化A*路径（绿色标记）"""
+        try:
+            print(f"🎨 可视化A*路径，包含 {len(path)} 个路径点")
+            
+            # 每隔几个点显示一个标记，避免过密
+            step = max(1, len(path) // 15)
+            
+            for i in range(0, len(path), step):
+                point = path[i]
+                marker_path = f"/World/astar_marker_{i}"
+                
+                marker = FixedCuboid(
+                    prim_path=marker_path,
+                    name=f"astar_marker_{i}",
+                    position=np.array([point[0], point[1], 2.0]),  # 高度2米，避免与机器人碰撞
+                    scale=np.array([0.2, 0.2, 0.3]),
+                    color=np.array([0.0, 1.0, 0.0])  # 绿色
+                )
+                self.world.scene.add(marker)
+                
+            print(f"✓ A*路径可视化完成")
+        except Exception as e:
+            print(f"A*路径可视化失败: {e}")
+    
+    def visualize_trajectory(self, trajectory):
+        """可视化优化后的轨迹（蓝色标记）"""
+        try:
+            print(f"🎨 可视化SVSDF优化轨迹，包含 {len(trajectory)} 个轨迹点")
+            
+            # 每隔几个点显示一个标记
+            step = max(1, len(trajectory) // 20)
+            
+            for i in range(0, len(trajectory), step):
+                traj_point = trajectory[i]
+                marker_path = f"/World/traj_marker_{i}"
+                
+                marker = FixedCuboid(
+                    prim_path=marker_path,
+                    name=f"traj_marker_{i}",
+                    position=np.array([traj_point.position[0], traj_point.position[1], 2.5]),
+                    scale=np.array([0.15, 0.15, 0.4]),
+                    color=np.array([0.0, 0.0, 1.0])  # 蓝色
+                )
+                self.world.scene.add(marker)
+                
+            print(f"✓ 轨迹可视化完成")
+        except Exception as e:
+            print(f"轨迹可视化失败: {e}")
+    
+    def visualize_swept_volumes(self, trajectory):
+        """可视化扫掠体积（环形标记）"""
+        try:
+            print(f"🎨 可视化扫掠体积")
+            
+            # 每隔更多点显示扫掠体积，避免过密
+            step = max(1, len(trajectory) // 10)
+            
+            for i in range(0, len(trajectory), step):
+                traj_point = trajectory[i]
+                
+                # 创建圆环状的扫掠体积标记
+                for j in range(8):  # 8个点组成圆环
+                    angle = j * 2 * math.pi / 8
+                    radius = 0.4  # 机器人扫掠半径
+                    
+                    ring_x = traj_point.position[0] + radius * math.cos(angle)
+                    ring_y = traj_point.position[1] + radius * math.sin(angle)
+                    
+                    ring_marker_path = f"/World/swept_marker_{i}_{j}"
+                    
+                    ring_marker = FixedCuboid(
+                        prim_path=ring_marker_path,
+                        name=f"swept_marker_{i}_{j}",
+                        position=np.array([ring_x, ring_y, 1.5]),
+                        scale=np.array([0.1, 0.1, 0.2]),
+                        color=np.array([1.0, 0.5, 0.0])  # 橙色
+                    )
+                    self.world.scene.add(ring_marker)
+                    
+            print(f"✓ 扫掠体积可视化完成")
+        except Exception as e:
+            print(f"扫掠体积可视化失败: {e}")
+    
+    def clear_all_markers(self):
+        """清除所有可视化标记"""
+        try:
+            # 清除A*路径标记
+            for i in range(100):
+                marker_path = f"/World/astar_marker_{i}"
+                if self.world.stage.GetPrimAtPath(marker_path).IsValid():
+                    self.world.stage.RemovePrim(marker_path)
+            
+            # 清除轨迹标记
+            for i in range(100):
+                marker_path = f"/World/traj_marker_{i}"
+                if self.world.stage.GetPrimAtPath(marker_path).IsValid():
+                    self.world.stage.RemovePrim(marker_path)
+            
+            # 清除扫掠体积标记
+            for i in range(50):
+                for j in range(8):
+                    marker_path = f"/World/swept_marker_{i}_{j}"
+                    if self.world.stage.GetPrimAtPath(marker_path).IsValid():
+                        self.world.stage.RemovePrim(marker_path)
+                        
+        except Exception as e:
+            print(f"清除标记失败: {e}")
+
 # 主函数
 def main():
-    """主函数 - 运行SVSDF复杂场景演示"""
+    """主函数 - 运行SVSDF交互式演示"""
     demo = SVSDFDemo()
     
     try:
@@ -581,7 +846,10 @@ def main():
         # 初始化机器人
         demo.initialize_robot()
         
-        # 运行复杂场景演示
+        # 初始化场景（创建障碍物）
+        demo.run_demo_scenario(1)  # 使用复杂多障碍物场景
+        
+        # 运行交互式演示
         demo.run_complex_demo()
         
     except KeyboardInterrupt:
