@@ -695,9 +695,6 @@ class SVSDFDemo:
             # 清除旧的可视化
             self.clear_all_markers()
             
-            # 可视化A*路径
-            self.visualize_astar_path(astar_path)
-            
             # 阶段2和3: SVSDF优化（暂时简化）
             print(f"阶段2: MINCO第一阶段优化（轨迹平滑化）...")
             print(f"阶段3: MINCO第二阶段优化（扫掠体积最小化）...")
@@ -716,11 +713,9 @@ class SVSDFDemo:
             
             self.current_trajectory = trajectory_points
             
-            # 可视化优化后的轨迹
-            self.visualize_trajectory(trajectory_points)
-            
-            # 可视化扫掠体积
-            self.visualize_swept_volumes(trajectory_points)
+            # 使用SVSDF虚光圈可视化替代乱七八糟的方块
+            print(f"阶段4: SVSDF可视化（虚光圈显示到障碍物距离）...")
+            self.visualize_svsdf_rings(trajectory_points)
             
             print(f"✓ SVSDF轨迹优化完成")
             return True
@@ -729,104 +724,110 @@ class SVSDFDemo:
             print(f"❌ SVSDF规划失败: {e}")
             return False
     
-    def visualize_astar_path(self, path):
-        """可视化A*路径（绿色标记）"""
+    def visualize_svsdf_rings(self, trajectory):
+        """使用虚光圈可视化SVSDF - 参考成功的guangquan_simple.py"""
         try:
-            print(f"🎨 可视化A*路径，包含 {len(path)} 个路径点")
+            print(f"🎨 创建SVSDF虚光圈可视化")
             
-            # 每隔几个点显示一个标记，避免过密
-            step = max(1, len(path) // 15)
+            # 清除旧的可视化
+            self.clear_sdf_rings()
             
-            for i in range(0, len(path), step):
-                point = path[i]
-                marker_path = f"/World/astar_marker_{i}"
-                
-                marker = FixedCuboid(
-                    prim_path=marker_path,
-                    name=f"astar_marker_{i}",
-                    position=np.array([point[0], point[1], 2.0]),  # 高度2米，避免与机器人碰撞
-                    scale=np.array([0.2, 0.2, 0.3]),
-                    color=np.array([0.0, 1.0, 0.0])  # 绿色
-                )
-                self.world.scene.add(marker)
-                
-            print(f"✓ A*路径可视化完成")
-        except Exception as e:
-            print(f"A*路径可视化失败: {e}")
-    
-    def visualize_trajectory(self, trajectory):
-        """可视化优化后的轨迹（蓝色标记）"""
-        try:
-            print(f"🎨 可视化SVSDF优化轨迹，包含 {len(trajectory)} 个轨迹点")
-            
-            # 每隔几个点显示一个标记
-            step = max(1, len(trajectory) // 20)
+            # 为轨迹上的关键点创建虚光圈
+            step = max(1, len(trajectory) // 8)  # 减少圈数避免过密
             
             for i in range(0, len(trajectory), step):
                 traj_point = trajectory[i]
-                marker_path = f"/World/traj_marker_{i}"
+                pos = [traj_point.position[0], traj_point.position[1]]
                 
-                marker = FixedCuboid(
-                    prim_path=marker_path,
-                    name=f"traj_marker_{i}",
-                    position=np.array([traj_point.position[0], traj_point.position[1], 2.5]),
-                    scale=np.array([0.15, 0.15, 0.4]),
-                    color=np.array([0.0, 0.0, 1.0])  # 蓝色
-                )
-                self.world.scene.add(marker)
+                # 计算该点到所有障碍物的最小距离（SDF值）
+                min_distance = self.compute_sdf_at_point(pos)
                 
-            print(f"✓ 轨迹可视化完成")
+                # 创建虚光圈，半径等于SDF值
+                self.create_sdf_ring(i, pos, min_distance)
+                
+            print(f"✓ SVSDF虚光圈可视化完成")
         except Exception as e:
-            print(f"轨迹可视化失败: {e}")
+            print(f"SVSDF可视化失败: {e}")
     
-    def visualize_swept_volumes(self, trajectory):
-        """可视化扫掠体积（环形标记）"""
-        try:
-            print(f"🎨 可视化扫掠体积")
-            
-            # 每隔更多点显示扫掠体积，避免过密
-            step = max(1, len(trajectory) // 10)
-            
-            for i in range(0, len(trajectory), step):
-                traj_point = trajectory[i]
+    def compute_sdf_at_point(self, point):
+        """计算点到最近障碍物的距离"""
+        min_dist = float('inf')
+        
+        # 遍历演示场景中的障碍物配置来计算精确距离
+        scenario = self.demo_scenarios[1]  # 使用当前场景
+        
+        for obs in scenario['obstacles']:
+            if obs['type'] == 'circle':
+                # 圆形障碍物
+                center = obs['center']
+                radius = obs['radius']
+                dist_to_center = np.linalg.norm(np.array(point) - np.array(center))
+                dist = max(0.1, dist_to_center - radius - 0.2)  # 减去半径和安全余量
                 
-                # 创建圆环状的扫掠体积标记
-                for j in range(8):  # 8个点组成圆环
-                    angle = j * 2 * math.pi / 8
-                    radius = 0.4  # 机器人扫掠半径
-                    
-                    ring_x = traj_point.position[0] + radius * math.cos(angle)
-                    ring_y = traj_point.position[1] + radius * math.sin(angle)
-                    
-                    ring_marker_path = f"/World/swept_marker_{i}_{j}"
-                    
-                    ring_marker = FixedCuboid(
-                        prim_path=ring_marker_path,
-                        name=f"swept_marker_{i}_{j}",
-                        position=np.array([ring_x, ring_y, 1.5]),
-                        scale=np.array([0.1, 0.1, 0.2]),
-                        color=np.array([1.0, 0.5, 0.0])  # 橙色
-                    )
-                    self.world.scene.add(ring_marker)
-                    
-            print(f"✓ 扫掠体积可视化完成")
+            elif obs['type'] == 'rectangle':
+                # 矩形障碍物（简化为圆形）
+                center = obs['center']
+                size = obs['size']
+                equiv_radius = max(size[0], size[1]) / 2 + 0.2
+                dist_to_center = np.linalg.norm(np.array(point) - np.array(center))
+                dist = max(0.1, dist_to_center - equiv_radius)
+            
+            min_dist = min(min_dist, dist)
+        
+        # 确保距离在合理范围内
+        return max(0.2, min(min_dist, 2.5))
+    
+    def create_sdf_ring(self, index, position, radius):
+        """创建SDF虚光圈"""
+        ring_path = f"/World/SDF_Ring_{index}"
+        
+        # 创建圆环（薄圆柱体）
+        ring_prim = prim_utils.create_prim(ring_path, "Cylinder")
+        ring = UsdGeom.Cylinder(ring_prim)
+        ring.CreateRadiusAttr().Set(radius)
+        ring.CreateHeightAttr().Set(0.05)  # 很薄的圆环
+        ring.CreateAxisAttr().Set("Z")
+        
+        # 设置位置和颜色
+        xform = UsdGeom.Xformable(ring_prim)
+        xform.ClearXformOpOrder()
+        
+        translate_op = xform.AddTranslateOp(UsdGeom.XformOp.PrecisionDouble)
+        translate_op.Set(Gf.Vec3d(position[0], position[1], 0.1))
+        
+        # 根据距离设置颜色：近=红色，远=绿色
+        color_factor = min(1.0, radius / 2.0)
+        color = (1.0 - color_factor, color_factor, 0.2)  # 红到绿渐变
+        
+        ring.CreateDisplayColorAttr().Set([color])
+        
+        print(f"  创建SDF光圈 {index}: 位置({position[0]:.1f}, {position[1]:.1f}), 半径={radius:.2f}m")
+        
+    def clear_sdf_rings(self):
+        """清除所有SDF光圈"""
+        try:
+            for i in range(20):  # 清除可能的光圈
+                ring_path = f"/World/SDF_Ring_{i}"
+                if self.world.stage.GetPrimAtPath(ring_path).IsValid():
+                    self.world.stage.RemovePrim(ring_path)
         except Exception as e:
-            print(f"扫掠体积可视化失败: {e}")
+            print(f"清除SDF光圈失败: {e}")
     
     def clear_all_markers(self):
         """清除所有可视化标记"""
         try:
-            # 清除A*路径标记
-            for i in range(100):
-                marker_path = f"/World/astar_marker_{i}"
-                if self.world.stage.GetPrimAtPath(marker_path).IsValid():
-                    self.world.stage.RemovePrim(marker_path)
+            # 清除SDF光圈
+            self.clear_sdf_rings()
             
-            # 清除轨迹标记
+            # 清除其他旧标记
             for i in range(100):
-                marker_path = f"/World/traj_marker_{i}"
-                if self.world.stage.GetPrimAtPath(marker_path).IsValid():
-                    self.world.stage.RemovePrim(marker_path)
+                marker_paths = [
+                    f"/World/astar_marker_{i}",
+                    f"/World/traj_marker_{i}"
+                ]
+                for marker_path in marker_paths:
+                    if self.world.stage.GetPrimAtPath(marker_path).IsValid():
+                        self.world.stage.RemovePrim(marker_path)
             
             # 清除扫掠体积标记
             for i in range(50):
