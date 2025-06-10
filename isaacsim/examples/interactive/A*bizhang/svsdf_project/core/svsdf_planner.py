@@ -1,35 +1,4 @@
 # core/svsdf_planner.py
-"""
-SVSDF (Swept Volum@dataclass
-class PlanningResult:
-    """规划结果数据结构"""
-    success: bool = False
-    trajectory: Optional[List[np.ndarray]] = None
-    planning_time: float = 0.0
-    swept_volume_info: Optional[Dict] = None
-    performance_metrics: Optional[Dict] = None
-    
-    def __post_init__(self):
-        if self.trajectory is None:
-            self.trajectory = []
-        if self.swept_volume_info is None:
-            self.swept_volume_info = {}
-        if self.performance_metrics is None:
-            self.performance_metrics = {} 轨迹规划器主控制器
-基于扫掠体积感知的高效轨迹规划系统
-
-集成四个阶段：
-1. A*初始路径搜索
-2. MINCO第一阶段优化（轨迹平滑化）
-3. MINCO第二阶段优化（扫掠体积最小化）
-4. MPC实时跟踪控制
-
-核心技术特点：
-- 工业级优化算法（Armijo线搜索、并行计算）
-- 扫掠体积SDF快速计算
-- 高效可视化
-- 实时性能监控和优化
-"""
 import numpy as np
 from typing import List, Dict, Tuple, Optional, Callable, Any
 import time
