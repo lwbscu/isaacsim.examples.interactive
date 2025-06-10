@@ -451,7 +451,8 @@ class SVSDFDemo:
                 if target_prim.IsValid():
                     xform = UsdGeom.Xformable(target_prim)
                     xform.ClearXformOpOrder()
-                    translate_op = xform.AddTranslateOp()
+                    # 使用一致的精度类型
+                    translate_op = xform.AddTranslateOp(UsdGeom.XformOp.PrecisionDouble)
                     translate_op.Set(Gf.Vec3d(self.goal_pos[0], self.goal_pos[1], 0.3))
             except Exception as e:
                 print(f"更新目标位置失败: {e}")
@@ -507,7 +508,10 @@ class SVSDFDemo:
         print("\n🎮 交互模式开始！使用箭头键移动目标，SPACE开始导航，ESC退出")
         
         try:
-            while self.running:
+            while self.running and simulation_app.is_running():
+                # 更新应用状态 - 参考成功的虚光圈示例
+                simulation_app.update()
+                
                 # 更新仿真
                 self.world.step(render=True)
                 
@@ -589,12 +593,12 @@ class SVSDFDemo:
             # 清除现有的XForm操作
             self.robot_xform.ClearXformOpOrder()
             
-            # 设置平移
-            translate_op = self.robot_xform.AddTranslateOp()
+            # 设置平移 - 使用一致的精度类型
+            translate_op = self.robot_xform.AddTranslateOp(UsdGeom.XformOp.PrecisionDouble)
             translate_op.Set(Gf.Vec3d(position[0], position[1], position[2]))
             
-            # 设置旋转
-            rotate_op = self.robot_xform.AddRotateZOp()
+            # 设置旋转 - 使用一致的精度类型
+            rotate_op = self.robot_xform.AddRotateZOp(UsdGeom.XformOp.PrecisionDouble)
             rotate_op.Set(math.degrees(yaw))
             
             # 更新当前状态
@@ -837,9 +841,19 @@ class SVSDFDemo:
 # 主函数
 def main():
     """主函数 - 运行SVSDF交互式演示"""
-    demo = SVSDFDemo()
     
     try:
+        print("🌟 正在启动Isaac Sim SVSDF演示...")
+        
+        # 等待 simulation_app 完全初始化 - 参考成功的虚光圈示例
+        while not simulation_app.is_running():
+            simulation_app.update()
+            time.sleep(0.1)
+        
+        print("✅ Isaac Sim启动完成")
+        
+        demo = SVSDFDemo()
+        
         # 初始化Isaac Sim
         demo.initialize_isaac_sim()
         
@@ -853,13 +867,18 @@ def main():
         demo.run_complex_demo()
         
     except KeyboardInterrupt:
-        print("\n\n用户中断演示")
+        print("\n🛑 用户中断演示")
     except Exception as e:
-        print(f"演示运行异常: {e}")
+        print(f"❌ 演示异常: {e}")
         import traceback
         traceback.print_exc()
     finally:
-        demo.cleanup()
+        if 'demo' in locals():
+            demo.cleanup()
+        print("🧹 关闭仿真应用...")
+        simulation_app.close()
+        print("✅ 演示结束")
+
 
 if __name__ == "__main__":
     main()
