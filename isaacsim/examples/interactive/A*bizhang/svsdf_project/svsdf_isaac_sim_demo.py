@@ -306,33 +306,173 @@ class SVSDFDemo:
         return True
     
     def execute_trajectory(self):
-        """执行轨迹跟踪"""
+        """执行轨迹跟踪 - 使用真正的物理控制"""
         if not self.current_trajectory:
             print("没有可执行的轨迹")
             return False
         
-        print("开始执行轨迹跟踪...")
+        print("🚀 开始执行物理轨迹跟踪...")
+        self.trajectory_executing = True
+        self.trajectory_index = 0
+        self.trajectory_start_time = time.time()
         
-        # 简化的轨迹跟踪：逐点移动机器人
-        for i, traj_point in enumerate(self.current_trajectory):
-            # 计算进度
-            progress = (i + 1) / len(self.current_trajectory) * 100
-            
-            # 设置机器人位置
-            self.set_robot_pose(
-                [traj_point.position[0], traj_point.position[1], 0.1],
-                traj_point.position[2]  # yaw
-            )
-            
-            # 打印进度
-            if i % 5 == 0 or i == len(self.current_trajectory) - 1:
-                print(f"执行进度: {progress:.1f}% - 位置: ({traj_point.position[0]:.2f}, {traj_point.position[1]:.2f})")
-            
-            # 等待一帧
-            self.world.step(render=True)
-            time.sleep(0.1)
+        # 启动轨迹跟踪控制循环
+        self._execute_trajectory_control_loop()
         
-        print("轨迹执行完成")
+        return True
+    
+    def _execute_trajectory_control_loop(self):
+        """轨迹跟踪控制循环 - 真正的物理控制"""
+        if not self.trajectory_executing or not self.current_trajectory:
+            return
+        
+        current_pos, current_yaw = self.get_robot_pose()
+        elapsed_time = time.time() - self.trajectory_start_time
+        
+        # 检查是否完成轨迹
+        if self.trajectory_index >= len(self.current_trajectory):
+            print("✅ 轨迹执行完成!")
+            self.trajectory_executing = False
+            self.apply_robot_control(0.0, 0.0)  # 停止机器人
+            return
+        
+        # 获取当前目标轨迹点
+        target_point = self.current_trajectory[self.trajectory_index]
+        target_pos = target_point.position[:2]
+        
+        # 计算到目标点的距离
+        dx = target_pos[0] - current_pos[0]
+        dy = target_pos[1] - current_pos[1]
+        distance = math.sqrt(dx*dx + dy*dy)
+        
+        # 调试信息
+        if self.trajectory_index % 5 == 0:
+            print(f"🤖 轨迹点 {self.trajectory_index}/{len(self.current_trajectory)}: "
+                  f"当前位置: ({current_pos[0]:.2f}, {current_pos[1]:.2f}), "
+                  f"目标位置: ({target_pos[0]:.2f}, {target_pos[1]:.2f}), "
+                  f"距离: {distance:.2f}m")
+        
+        # 如果接近目标点，移动到下一个点
+        if distance < 0.25:  # 25cm容差
+            self.trajectory_index += 1
+            if self.trajectory_index >= len(self.current_trajectory):
+                print("✅ 轨迹执行完成!")
+                self.trajectory_executing = False
+                self.apply_robot_control(0.0, 0.0)
+                return
+        
+        # 计算控制指令
+        target_angle = math.atan2(dy, dx)
+        angle_diff = target_angle - current_yaw
+        
+        # 角度归一化
+        while angle_diff > math.pi:
+            angle_diff -= 2 * math.pi
+        while angle_diff < -math.pi:
+            angle_diff += 2 * math.pi
+        
+        # PID控制参数
+        kp_linear = 1.2
+        kp_angular = 2.5
+        
+        # 计算控制命令
+        linear_vel = min(kp_linear * distance, 0.5)  # 限制最大线速度
+        angular_vel = kp_angular * angle_diff
+        
+        # 限制角速度
+        angular_vel = max(-1.5, min(1.5, angular_vel))
+        
+        # 如果角度偏差太大，优先转向
+        if abs(angle_diff) > math.pi/4:
+            linear_vel *= 0.3
+        
+        # 应用控制指令
+        self.apply_robot_control(linear_vel, angular_vel)
+        
+        # 调度下一次控制更新
+        # 在Isaac Sim中，我们需要在下一个仿真步骤中继续执行
+        # 这将通过update_robot_control方法调用
+    
+    def update_robot_control(self):
+        """实时更新机器人控制 - 在主循环中调用，确保物理移动"""
+        if not self.trajectory_executing or not self.current_trajectory:
+            # 停止机器人
+            self.apply_robot_control(0.0, 0.0)
+            return True
+        
+        if self.trajectory_index >= len(self.current_trajectory):
+            print("轨迹执行完成")
+            self.trajectory_executing = False
+            self.apply_robot_control(0.0, 0.0)
+            return True
+        
+        # 获取当前机器人位置（从底盘获取）
+        current_pos, current_yaw = self.get_robot_pose()
+        
+        # 获取目标轨迹点
+        target_point = self.current_trajectory[self.trajectory_index]
+        target_x = target_point.position[0]
+        target_y = target_point.position[1] 
+        target_yaw = target_point.position[2] if len(target_point.position) > 2 else current_yaw
+        
+        # 计算距离和角度误差
+        dx = target_x - current_pos[0]
+        dy = target_y - current_pos[1]
+        distance = math.sqrt(dx**2 + dy**2)
+        target_angle = math.atan2(dy, dx)
+        angle_error = target_angle - current_yaw
+        
+        # 归一化角度误差
+        while angle_error > math.pi:
+            angle_error -= 2 * math.pi
+        while angle_error < -math.pi:
+            angle_error += 2 * math.pi
+        
+        # 控制参数 - 调整以确保稳定的物理移动
+        linear_vel = 0.0
+        angular_vel = 0.0
+        
+        # 改进的PID控制器 - 确保底盘优先移动
+        if distance > 0.15:  # 距离阈值适中
+            # 计算基础线速度和角速度
+            kp_linear = 0.8  # 降低增益以获得更稳定的控制
+            kp_angular = 1.5
+            
+            # 如果角度误差较大，优先转向
+            if abs(angle_error) > 0.2:  # 约11度
+                angular_vel = np.clip(kp_angular * angle_error, -1.0, 1.0)
+                linear_vel = 0.1  # 转向时保持小的前进速度
+            else:
+                # 角度接近，主要前进
+                linear_vel = min(kp_linear * distance, 0.4)  # 限制最大速度
+                angular_vel = np.clip(kp_angular * angle_error * 0.5, -0.5, 0.5)  # 小幅角度调整
+        else:
+            # 到达当前点，前进到下一点
+            self.trajectory_index += 1
+            progress = (self.trajectory_index / len(self.current_trajectory)) * 100
+            print(f"✓ 到达轨迹点 {self.trajectory_index-1}, 进度: {progress:.1f}%")
+            
+            # 立即计算下一个目标，避免停顿
+            if self.trajectory_index < len(self.current_trajectory):
+                next_target = self.current_trajectory[self.trajectory_index]
+                next_dx = next_target.position[0] - current_pos[0]
+                next_dy = next_target.position[1] - current_pos[1]
+                next_distance = math.sqrt(next_dx**2 + next_dy**2)
+                next_angle = math.atan2(next_dy, next_dx)
+                next_angle_error = next_angle - current_yaw
+                
+                # 归一化角度
+                while next_angle_error > math.pi:
+                    next_angle_error -= 2 * math.pi
+                while next_angle_error < -math.pi:
+                    next_angle_error += 2 * math.pi
+                
+                # 提前开始转向下一个目标
+                linear_vel = min(0.6 * next_distance, 0.3)
+                angular_vel = np.clip(1.2 * next_angle_error, -0.8, 0.8)
+        
+        # 应用控制 - 确保底盘移动
+        self.apply_robot_control(linear_vel, angular_vel)
         return True
     
     def run_complex_demo(self):
@@ -534,8 +674,7 @@ class SVSDFDemo:
                 if target_prim.IsValid():
                     xform = UsdGeom.Xformable(target_prim)
                     xform.ClearXformOpOrder()
-                    # 使用一致的精度类型
-                    translate_op = xform.AddTranslateOp(UsdGeom.XformOp.PrecisionDouble)
+                    translate_op = xform.AddTranslateOp()
                     translate_op.Set(Gf.Vec3d(self.goal_pos[0], self.goal_pos[1], 0.3))
             except Exception as e:
                 print(f"更新目标位置失败: {e}")
@@ -567,35 +706,12 @@ class SVSDFDemo:
             print("⏸️ 自动导航关闭 - 使用箭头键移动目标，SPACE键开始")
     
     def request_replan(self):
-        """请求重新规划路径 - 优化版本：先清除后重新规划"""
+        """请求重新规划路径"""
         if self.auto_navigation:
-            print("🔄 开始重新规划路径...")
-            
-            # 1. 先清除所有旧的可视化
-            print("  🧹 清除旧路径和可视化...")
-            self.clear_sdf_rings()
-            self.clear_all_markers()
-            
-            # 2. 清空轨迹数据
-            self.current_trajectory = []
-            self.trajectory_index = 0
-            
-            # 3. 强制刷新场景
-            for _ in range(3):
-                self.world.step(render=True)
-                time.sleep(0.05)
-            
-            # 4. 重新规划路径
-            print("  🎯 重新规划新路径...")
+            print("🔄 重新规划路径...")
             success = self.run_svsdf_planning()
-            
             if success:
-                print("  ✅ 路径规划成功，开始执行")
                 self.execute_trajectory()
-            else:
-                print("  ❌ 路径规划失败")
-        else:
-            print("⚠️ 自动导航未启用")
     
     def set_random_target(self):
         """设置随机目标位置"""
@@ -612,21 +728,22 @@ class SVSDFDemo:
         """交互式主循环"""
         self.running = True
         print("\n🎮 交互模式开始！使用箭头键移动目标，SPACE开始导航，ESC退出")
+        print("🔧 机器人控制修复已应用 - 确保物理移动")
         
         try:
-            while self.running and simulation_app.is_running():
-                # 更新应用状态 - 参考成功的虚光圈示例
-                simulation_app.update()
-                
+            while self.running:
                 # 更新仿真
                 self.world.step(render=True)
+                
+                # 🔧 关键修复：更新机器人控制 - 确保机器人物理移动
+                self.update_robot_control()
                 
                 # 检查是否需要重新规划
                 if self.auto_navigation and self.goal_changed:
                     self.goal_changed = False
                     self.request_replan()
                 
-                time.sleep(0.05)  # 50Hz更新频率
+                time.sleep(0.02)  # 50Hz更新频率
                 
         except KeyboardInterrupt:
             print("\n用户中断")
@@ -654,7 +771,7 @@ class SVSDFDemo:
             print(f"清理资源时出错: {e}")
     
     def initialize_robot(self):
-        """初始化机器人 - 参考astar_interactive.py的实现"""
+        """初始化机器人 - 使用真正的物理驱动，而不是瞬移"""
         print("正在初始化Create-3机器人...")
         
         # 加载Create-3机器人USD文件
@@ -663,15 +780,30 @@ class SVSDFDemo:
         # 添加机器人到场景
         add_reference_to_stage(robot_usd_path, self.robot_prim_path)
         
+        # 等待世界重置完成
+        self.world.reset()
+        
         # 获取机器人prim和transform
         self.robot_prim = self.world.stage.GetPrimAtPath(self.robot_prim_path)
         self.robot_xform = UsdGeom.Xformable(self.robot_prim)
         
-        # 创建差分控制器
+        # 将机器人作为articulation添加到场景中 
+        from isaacsim.core.api.robots import Articulation
+        self.robot_articulation = Articulation(prim_path=self.robot_prim_path, name="create_3_robot")
+        self.world.scene.add(self.robot_articulation)
+        
+        # 重置世界以确保所有组件正确初始化
+        self.world.reset()
+        
+        # 获取机器人的关节信息
+        joint_names = self.robot_articulation.get_applied_action_space()
+        print(f"机器人关节: {joint_names}")
+        
+        # 创建差分控制器 - 确保参数与实际机器人匹配
         self.controller = DifferentialController(
-            name="diff_controller",
-            wheel_radius=0.0508,
-            wheel_base=0.235,
+            name="diff_controller", 
+            wheel_radius=0.0508,  # Create-3的轮子半径
+            wheel_base=0.235,     # Create-3的轮距
             max_linear_speed=0.5,
             max_angular_speed=1.5
         )
@@ -691,29 +823,127 @@ class SVSDFDemo:
         # 设置初始位置
         self.set_robot_pose(self.current_position, self.current_orientation)
         
-        print("机器人初始化完成")
+        # 初始化运动控制变量
+        self.current_linear_vel = 0.0
+        self.current_angular_vel = 0.0
+        self.trajectory_executing = False
+        
+        print("机器人初始化完成 - 使用物理驱动模式")
+    
+    def apply_robot_control(self, linear_vel: float, angular_vel: float):
+        """应用真正的物理控制到机器人（差分驱动底盘）"""
+        if not hasattr(self, 'robot_articulation') or self.robot_articulation is None:
+            return
+        
+        try:
+            # 使用差分控制器计算轮子速度
+            command = np.array([linear_vel, angular_vel])
+            articulation_action = self.controller.forward(command)
+            
+            # 确保我们控制的是底盘轮子，而不是机械臂
+            # Create-3机器人的底盘关节应该是轮子关节
+            # 检查关节名称，确保控制正确的关节
+            joint_names = self.robot_articulation.get_applied_action_space()
+            print(f"应用控制到关节: {joint_names}")
+            print(f"控制命令 - 线速度: {linear_vel:.3f}, 角速度: {angular_vel:.3f}")
+            
+            # 应用控制动作到机器人的关节（底盘轮子）
+            self.robot_articulation.apply_action(articulation_action)
+            
+            # 更新当前速度状态
+            self.current_linear_vel = linear_vel
+            self.current_angular_vel = angular_vel
+            
+        except Exception as e:
+            print(f"应用机器人控制失败: {e}")
+            print(f"尝试的控制命令 - 线速度: {linear_vel}, 角速度: {angular_vel}")
+            
+            # 如果标准方法失败，尝试直接设置关节速度
+            try:
+                # 获取所有可驱动关节的信息
+                dof_names = self.robot_articulation.dof_names
+                print(f"可用自由度: {dof_names}")
+                
+                # 查找轮子关节（通常包含 "wheel" 或 "left"/"right"）
+                wheel_joints = [name for name in dof_names if 'wheel' in name.lower() or 'left' in name.lower() or 'right' in name.lower()]
+                print(f"检测到的轮子关节: {wheel_joints}")
+                
+                if len(wheel_joints) >= 2:
+                    # 计算左右轮速度
+                    wheel_base = 0.235  # Create-3轮距
+                    wheel_radius = 0.0508  # Create-3轮子半径
+                    
+                    # 差分驱动运动学
+                    left_wheel_vel = (linear_vel - angular_vel * wheel_base / 2) / wheel_radius
+                    right_wheel_vel = (linear_vel + angular_vel * wheel_base / 2) / wheel_radius
+                    
+                    # 创建速度数组
+                    velocities = np.zeros(len(dof_names))
+                    for i, name in enumerate(dof_names):
+                        if 'left' in name.lower():
+                            velocities[i] = left_wheel_vel
+                        elif 'right' in name.lower():
+                            velocities[i] = right_wheel_vel
+                    
+                    # 应用速度
+                    self.robot_articulation.set_joint_velocities(velocities)
+                    print(f"直接设置轮子速度: 左轮={left_wheel_vel:.3f}, 右轮={right_wheel_vel:.3f}")
+                
+            except Exception as e2:
+                print(f"备用控制方法也失败: {e2}")
+            
+    def get_robot_pose(self):
+        """获取机器人当前位置和朝向 - 从底盘获取而不是机械臂"""
+        if hasattr(self, 'robot_articulation') and self.robot_articulation is not None:
+            try:
+                # 从articulation获取真实的物理位置（底盘位置）
+                position, orientation = self.robot_articulation.get_world_pose()
+                
+                # 转换四元数到yaw角
+                import math
+                try:
+                    from scipy.spatial.transform import Rotation as R
+                    r = R.from_quat([orientation[1], orientation[2], orientation[3], orientation[0]])
+                    euler = r.as_euler('xyz', degrees=False)
+                    yaw = euler[2]
+                except ImportError:
+                    # 如果scipy不可用，使用简单的四元数转换
+                    # q = [w, x, y, z] -> yaw
+                    w, x, y, z = orientation[0], orientation[1], orientation[2], orientation[3]
+                    yaw = math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+                
+                # 更新内部状态
+                self.current_position = position
+                self.current_orientation = yaw
+                
+                # 调试输出
+                if hasattr(self, 'trajectory_executing') and self.trajectory_executing:
+                    print(f"机器人位置: ({position[0]:.3f}, {position[1]:.3f}), 朝向: {math.degrees(yaw):.1f}°")
+                
+                return position.copy(), yaw
+            except Exception as e:
+                print(f"获取机器人位置失败: {e}")
+                return self.current_position.copy(), self.current_orientation
+        else:
+            return self.current_position.copy(), self.current_orientation
     
     def set_robot_pose(self, position, yaw):
-        """设置机器人位置和朝向 - 参考astar_interactive.py"""
+        """设置机器人位置和朝向 - 仅用于初始化"""
         if self.robot_prim and self.robot_xform:
             # 清除现有的XForm操作
             self.robot_xform.ClearXformOpOrder()
             
-            # 设置平移 - 使用一致的精度类型
-            translate_op = self.robot_xform.AddTranslateOp(UsdGeom.XformOp.PrecisionDouble)
+            # 设置平移
+            translate_op = self.robot_xform.AddTranslateOp()
             translate_op.Set(Gf.Vec3d(position[0], position[1], position[2]))
             
-            # 设置旋转 - 使用一致的精度类型
-            rotate_op = self.robot_xform.AddRotateZOp(UsdGeom.XformOp.PrecisionDouble)
+            # 设置旋转
+            rotate_op = self.robot_xform.AddRotateZOp()
             rotate_op.Set(math.degrees(yaw))
             
             # 更新当前状态
             self.current_position = np.array(position)
             self.current_orientation = yaw
-            
-    def get_robot_pose(self):
-        """获取机器人当前位置"""
-        return self.current_position.copy(), self.current_orientation
     
     def create_obstacles_for_scenario(self, obstacles):
         """为场景创建障碍物"""
@@ -801,6 +1031,9 @@ class SVSDFDemo:
             # 清除旧的可视化
             self.clear_all_markers()
             
+            # 可视化A*路径
+            self.visualize_astar_path(astar_path)
+            
             # 阶段2和3: SVSDF优化（暂时简化）
             print(f"阶段2: MINCO第一阶段优化（轨迹平滑化）...")
             print(f"阶段3: MINCO第二阶段优化（扫掠体积最小化）...")
@@ -819,9 +1052,11 @@ class SVSDFDemo:
             
             self.current_trajectory = trajectory_points
             
-            # 使用SVSDF虚光圈可视化替代乱七八糟的方块
-            print(f"阶段4: SVSDF可视化（虚光圈显示到障碍物距离）...")
-            self.visualize_svsdf_rings(trajectory_points)
+            # 可视化优化后的轨迹
+            self.visualize_trajectory(trajectory_points)
+            
+            # 可视化扫掠体积
+            self.visualize_swept_volumes(trajectory_points)
             
             print(f"✓ SVSDF轨迹优化完成")
             return True
@@ -830,217 +1065,104 @@ class SVSDFDemo:
             print(f"❌ SVSDF规划失败: {e}")
             return False
     
-    def visualize_svsdf_rings(self, trajectory):
-        """使用虚光圈可视化SVSDF - 优化版本：相切验证 + 完美圆形显示"""
+    def visualize_astar_path(self, path):
+        """可视化A*路径（绿色标记）"""
         try:
-            print(f"🎨 创建SVSDF虚光圈可视化")
+            print(f"🎨 可视化A*路径，包含 {len(path)} 个路径点")
             
-            # 清除旧的可视化
-            self.clear_sdf_rings()
+            # 每隔几个点显示一个标记，避免过密
+            step = max(1, len(path) // 15)
             
-            # 验证切线条件
-            is_valid = self.verify_tangent_condition(trajectory)
+            for i in range(0, len(path), step):
+                point = path[i]
+                marker_path = f"/World/astar_marker_{i}"
+                
+                marker = FixedCuboid(
+                    prim_path=marker_path,
+                    name=f"astar_marker_{i}",
+                    position=np.array([point[0], point[1], 2.0]),  # 高度2米，避免与机器人碰撞
+                    scale=np.array([0.2, 0.2, 0.3]),
+                    color=np.array([0.0, 1.0, 0.0])  # 绿色
+                )
+                self.world.scene.add(marker)
+                
+            print(f"✓ A*路径可视化完成")
+        except Exception as e:
+            print(f"A*路径可视化失败: {e}")
+    
+    def visualize_trajectory(self, trajectory):
+        """可视化优化后的轨迹（蓝色标记）"""
+        try:
+            print(f"🎨 可视化SVSDF优化轨迹，包含 {len(trajectory)} 个轨迹点")
             
-            # 为轨迹上的关键点创建虚光圈
-            step = max(1, len(trajectory) // 8)  # 减少圈数避免过密
-            created_rings = 0
+            # 每隔几个点显示一个标记
+            step = max(1, len(trajectory) // 20)
             
             for i in range(0, len(trajectory), step):
                 traj_point = trajectory[i]
-                pos = [traj_point.position[0], traj_point.position[1]]
+                marker_path = f"/World/traj_marker_{i}"
                 
-                # 计算该点到所有障碍物的最小距离（SDF值）
-                min_distance = self.compute_sdf_at_point(pos)
+                marker = FixedCuboid(
+                    prim_path=marker_path,
+                    name=f"traj_marker_{i}",
+                    position=np.array([traj_point.position[0], traj_point.position[1], 2.5]),
+                    scale=np.array([0.15, 0.15, 0.4]),
+                    color=np.array([0.0, 0.0, 1.0])  # 蓝色
+                )
+                self.world.scene.add(marker)
                 
-                # 创建虚光圈，半径等于SDF值（确保与障碍物相切）
-                ring_created = self.create_sdf_ring(i, pos, min_distance)
-                if ring_created:
-                    created_rings += 1
-                
-            print(f"✓ SVSDF虚光圈可视化完成: {created_rings}个相切圆环")
-            
-            # 如果切线验证通过，显示成功消息
-            if is_valid:
-                print(f"  🎯 完美相切: 扫掠体积与障碍物精确相切，无重叠无缝隙")
-            else:
-                print(f"  ⚠️ 需要优化: 部分区域可进一步优化切线条件")
-                
+            print(f"✓ 轨迹可视化完成")
         except Exception as e:
-            print(f"SVSDF可视化失败: {e}")
+            print(f"轨迹可视化失败: {e}")
     
-    def compute_sdf_at_point(self, point):
-        """计算点到最近障碍物的精确距离 - 优化版本：确保相切无缝隙"""
-        min_dist = float('inf')
-        point = np.array(point, dtype=np.float64)  # 高精度计算
-        
-        # 遍历演示场景中的障碍物配置来计算精确距离
-        scenario = self.demo_scenarios[1]  # 使用当前场景
-        
-        for obs in scenario['obstacles']:
-            if obs['type'] == 'circle':
-                # 圆形障碍物 - 精确计算
-                center = np.array(obs['center'], dtype=np.float64)
-                radius = float(obs['radius'])
-                
-                # 计算点到圆心的距离
-                dist_to_center = np.linalg.norm(point - center)
-                
-                # SDF距离：点到圆边界的距离
-                sdf_dist = dist_to_center - radius
-                
-                # 确保扫掠圆与障碍物精确相切（无重叠，无缝隙）
-                # 加上机器人半径（假设为0.15m）确保安全相切
-                robot_radius = 0.15
-                tangent_dist = max(0.08, sdf_dist - robot_radius)
-                
-            elif obs['type'] == 'rectangle':
-                # 矩形障碍物 - 使用Inigo Quilez算法精确计算
-                center = np.array(obs['center'], dtype=np.float64)
-                half_size = np.array(obs['size'], dtype=np.float64) / 2.0
-                
-                # 矩形SDF计算
-                relative_pos = np.abs(point - center) - half_size
-                outside_dist = np.linalg.norm(np.maximum(relative_pos, 0.0))
-                inside_dist = min(max(relative_pos[0], relative_pos[1]), 0.0)
-                rect_sdf = outside_dist + inside_dist
-                
-                # 加上机器人半径确保相切
-                robot_radius = 0.15
-                tangent_dist = max(0.08, rect_sdf - robot_radius)
-            
-            min_dist = min(min_dist, tangent_dist)
-        
-        # 确保距离在合理范围内，最小距离保证可视化效果
-        final_dist = max(0.08, min(min_dist, 2.0))
-        
-        return final_dist
-    
-    def create_sdf_ring(self, index, position, radius):
-        """创建SDF虚光圈 - 优化版本：完美圆形，相切显示"""
-        timestamp = int(time.time() * 1000) % 10000  # 避免路径冲突
-        ring_path = f"/World/PerfectSDF_Ring_{index}_{timestamp}"
-        
+    def visualize_swept_volumes(self, trajectory):
+        """可视化扫掠体积（环形标记）"""
         try:
-            # 创建高质量圆环（使用圆柱体确保完美圆形）
-            ring_prim = prim_utils.create_prim(ring_path, "Cylinder")
-            ring = UsdGeom.Cylinder(ring_prim)
+            print(f"🎨 可视化扫掠体积")
             
-            # 设置几何属性：完美圆形
-            ring.CreateRadiusAttr().Set(float(radius))
-            ring.CreateHeightAttr().Set(0.02)  # 极薄的圆环
-            ring.CreateAxisAttr().Set("Z")      # Z轴向上
+            # 每隔更多点显示扫掠体积，避免过密
+            step = max(1, len(trajectory) // 10)
             
-            # 设置变换：精确定位
-            xform = UsdGeom.Xformable(ring_prim)
-            xform.ClearXformOpOrder()
-            
-            # 使用高精度坐标
-            translate_op = xform.AddTranslateOp(UsdGeom.XformOp.PrecisionDouble)
-            translate_op.Set(Gf.Vec3d(float(position[0]), float(position[1]), 0.05))
-            
-            # 智能颜色映射：基于与障碍物的相对距离
-            if radius < 0.2:
-                color = (1.0, 0.0, 0.0)    # 红色 - 危险（非常接近障碍物）
-                opacity = 0.9
-            elif radius < 0.5:
-                color = (1.0, 0.5, 0.0)    # 橙色 - 警告
-                opacity = 0.8
-            elif radius < 1.0:
-                color = (1.0, 1.0, 0.0)    # 黄色 - 注意
-                opacity = 0.7
-            else:
-                color = (0.0, 1.0, 0.0)    # 绿色 - 安全（远离障碍物）
-                opacity = 0.6
-            
-            # 设置显示属性
-            ring.CreateDisplayColorAttr().Set([color])
-            ring.CreateDisplayOpacityAttr().Set([opacity])
-            
-            # 确保材质属性用于更好的渲染
-            try:
-                # 设置发光效果，突出相切关系
-                ring.CreatePurposeAttr().Set("render")
-            except:
-                pass
-            
-            print(f"  ✨ 完美SDF圆环 {index}: 位置({position[0]:.3f}, {position[1]:.3f}), 半径={radius:.4f}m, 相切显示")
-            return ring_path
-            
-        except Exception as e:
-            print(f"  ❌ 创建SDF圆环失败: {e}")
-            return None
-        
-    def clear_sdf_rings(self):
-        """清除所有SDF光圈 - 优化版本：彻底清除，支持新路径规划"""
-        cleared_count = 0
-        try:
-            stage = self.world.stage
-            
-            # 方法1: 清除传统命名的SDF圆环
-            for i in range(50):  # 扩大清除范围
-                traditional_paths = [
-                    f"/World/SDF_Ring_{i}",
-                    f"/World/PerfectSDF_Ring_{i}",
-                    f"/World/sdf_ring_{i}",
-                ]
+            for i in range(0, len(trajectory), step):
+                traj_point = trajectory[i]
                 
-                for ring_path in traditional_paths:
-                    if stage.GetPrimAtPath(ring_path).IsValid():
-                        stage.RemovePrim(ring_path)
-                        cleared_count += 1
-                        
-            # 方法2: 基于时间戳的圆环清除（支持新的相切圆环）
-            world_prim = stage.GetPrimAtPath("/World")
-            if world_prim.IsValid():
-                children_to_remove = []
-                for child in world_prim.GetChildren():
-                    child_name = child.GetName()
-                    # 匹配所有可能的SDF圆环命名模式
-                    ring_keywords = [
-                        'SDF_Ring', 'PerfectSDF_Ring', 'TangentRing', 
-                        'Ring', 'SDF', 'Circle', 'Perfect', 'Tangent'
-                    ]
+                # 创建圆环状的扫掠体积标记
+                for j in range(8):  # 8个点组成圆环
+                    angle = j * 2 * math.pi / 8
+                    radius = 0.4  # 机器人扫掠半径
                     
-                    if any(keyword in child_name for keyword in ring_keywords):
-                        children_to_remove.append(child.GetPath())
-                        
-                # 批量删除
-                for path in children_to_remove:
-                    try:
-                        if stage.GetPrimAtPath(path).IsValid():
-                            stage.RemovePrim(path)
-                            cleared_count += 1
-                    except Exception as e:
-                        print(f"删除圆环失败 {path}: {e}")
-            
-            # 方法3: 强制场景刷新，确保清除生效
-            if cleared_count > 0:
-                for _ in range(5):
-                    self.world.step(render=True)
-                    time.sleep(0.02)
+                    ring_x = traj_point.position[0] + radius * math.cos(angle)
+                    ring_y = traj_point.position[1] + radius * math.sin(angle)
                     
-            print(f"  🧹 SDF圆环清除完成: {cleared_count} 个对象")
-            return cleared_count
-            
+                    ring_marker_path = f"/World/swept_marker_{i}_{j}"
+                    
+                    ring_marker = FixedCuboid(
+                        prim_path=ring_marker_path,
+                        name=f"swept_marker_{i}_{j}",
+                        position=np.array([ring_x, ring_y, 1.5]),
+                        scale=np.array([0.1, 0.1, 0.2]),
+                        color=np.array([1.0, 0.5, 0.0])  # 橙色
+                    )
+                    self.world.scene.add(ring_marker)
+                    
+            print(f"✓ 扫掠体积可视化完成")
         except Exception as e:
-            print(f"清除SDF圆环失败: {e}")
-            return 0
+            print(f"扫掠体积可视化失败: {e}")
     
     def clear_all_markers(self):
         """清除所有可视化标记"""
         try:
-            # 清除SDF光圈
-            self.clear_sdf_rings()
-            
-            # 清除其他旧标记
+            # 清除A*路径标记
             for i in range(100):
-                marker_paths = [
-                    f"/World/astar_marker_{i}",
-                    f"/World/traj_marker_{i}"
-                ]
-                for marker_path in marker_paths:
-                    if self.world.stage.GetPrimAtPath(marker_path).IsValid():
-                        self.world.stage.RemovePrim(marker_path)
+                marker_path = f"/World/astar_marker_{i}"
+                if self.world.stage.GetPrimAtPath(marker_path).IsValid():
+                    self.world.stage.RemovePrim(marker_path)
+            
+            # 清除轨迹标记
+            for i in range(100):
+                marker_path = f"/World/traj_marker_{i}"
+                if self.world.stage.GetPrimAtPath(marker_path).IsValid():
+                    self.world.stage.RemovePrim(marker_path)
             
             # 清除扫掠体积标记
             for i in range(50):
