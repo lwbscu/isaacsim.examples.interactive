@@ -156,6 +156,8 @@ class SVSDFDemo:
         # 轨迹相关
         self.current_trajectory = []
         self.trajectory_index = 0
+        self.trash_objects = []
+        self.target_cube = None
         
         # 可视化
         self.obstacle_prims = []
@@ -363,6 +365,87 @@ class SVSDFDemo:
         # 运行交互式循环
         self.interactive_loop()
     
+    def create_trash_objects(self, num_trash=5):
+        """创建随机的垃圾对象（小方块）"""
+        print(f"正在创建 {num_trash} 个垃圾对象...")
+        for i in range(num_trash):
+            prim_path = f"/World/trash_{i}"
+            position = np.array([
+                np.random.uniform(-7, 7),
+                np.random.uniform(-7, 7),
+                0.1
+            ])
+            scale = np.random.uniform(0.2, 0.4)
+            
+            trash_object = DynamicCuboid(
+                prim_path=prim_path,
+                name=f"trash_cube_{i}",
+                position=position,
+                scale=np.array([scale, scale, scale]),
+                color=np.array([0.6, 0.6, 0.9])  # 淡蓝色
+            )
+            self.world.scene.add(trash_object)
+            self.trash_objects.append(trash_object)
+            print(f"  创建了垃圾: {prim_path} at {position}")
+
+    def run_trash_collection_demo(self):
+        """运行垃圾收集演示"""
+        print("\n" + "="*60)
+        print("🤖 开始垃圾自动收集演示")
+        print("机器人将依次导航到每个垃圾对象。")
+        print("="*60)
+
+        # 1. 创建障碍物和垃圾
+        scenario = self.demo_scenarios[1] # 使用场景2的障碍物
+        self.create_obstacles_for_scenario(scenario['obstacles'])
+        self.create_trash_objects(num_trash=5)
+        self._wait_for_stability(2.0) 
+
+        # 2. 创建目标标记
+        self.create_target_cube()
+
+        # 3. 遍历所有垃圾
+        for i, trash in enumerate(self.trash_objects):
+            print(f"\n--- 前往第 {i+1}/{len(self.trash_objects)} 个垃圾 ---")
+            
+            # 检查垃圾是否还可见 (可能已被吸附)
+            if not trash.get_visibility():
+                print("  垃圾已被收集，跳过。")
+                continue
+
+            trash_position, _ = trash.get_world_pose()
+            print(f"垃圾位置: {trash_position}")
+
+            # 设置目标
+            self.goal_pos = trash_position
+            self.update_target_cube_position() 
+
+            # 规划并执行路径
+            print("  🎯 规划路径...")
+            success = self.run_svsdf_planning()
+
+            if success:
+                print("  ✅ 路径规划成功，开始执行")
+                self.execute_trajectory()
+                print("  🎉 到达垃圾位置!")
+                self.simulate_suction(trash)
+            else:
+                print(f"  ❌ 无法规划到垃圾 {i+1} 的路径，跳过。")
+
+            time.sleep(1.0)
+
+        print("\n" + "="*60)
+        print("✅ 所有垃圾收集任务完成!")
+        print("="*60)
+
+    def simulate_suction(self, trash_object):
+        """模拟吸附垃圾"""
+        print(f"⚡️ 正在吸附 {trash_object.name}...")
+        # 通过使其不可见来模拟吸附
+        trash_object.set_visibility(False)
+        time.sleep(1.0) 
+        print("💨 吸附完成!")
+
     def setup_input_handling(self):
         """设置输入处理 - 参考astar_interactive.py"""
         try:
@@ -1010,47 +1093,27 @@ class SVSDFDemo:
             print(f"切线验证异常: {e}")
             return False
 
-# 主函数
 def main():
-    """主函数 - 运行SVSDF交互式演示"""
-    
+    """主执行函数"""
+    demo = SVSDFDemo()
     try:
-        print("🌟 正在启动Isaac Sim SVSDF演示...")
-        
-        # 等待 simulation_app 完全初始化 - 参考成功的虚光圈示例
-        while not simulation_app.is_running():
-            simulation_app.update()
-            time.sleep(0.1)
-        
-        print("✅ Isaac Sim启动完成")
-        
-        demo = SVSDFDemo()
-        
-        # 初始化Isaac Sim
+        # 初始化
         demo.initialize_isaac_sim()
-        
-        # 初始化机器人
         demo.initialize_robot()
-        
-        # 初始化场景（创建障碍物）
-        demo.run_demo_scenario(1)  # 使用复杂多障碍物场景
-        
-        # 运行交互式演示
-        demo.run_complex_demo()
-        
-    except KeyboardInterrupt:
-        print("\n🛑 用户中断演示")
-    except Exception as e:
-        print(f"❌ 演示异常: {e}")
-        import traceback
-        traceback.print_exc()
-    finally:
-        if 'demo' in locals():
-            demo.cleanup()
-        print("🧹 关闭仿真应用...")
-        simulation_app.close()
-        print("✅ 演示结束")
 
+        # 运行垃圾收集演示
+        demo.run_trash_collection_demo()
+        
+        # 或者运行交互式演示
+        # demo.run_demo_scenario(1)
+        # demo.run_complex_demo()
+
+    except Exception as e:
+        print(f"演示过程中发生严重错误: {e}")
+    finally:
+        # 清理资源
+        demo.cleanup()
+        simulation_app.close()
 
 if __name__ == "__main__":
     main()

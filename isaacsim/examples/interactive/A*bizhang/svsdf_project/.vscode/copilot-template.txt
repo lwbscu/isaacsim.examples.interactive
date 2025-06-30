@@ -1,0 +1,14 @@
+请依次执行以下全面分析：
+
+#codebase 分析代码库结构和质量
+#changes 检查所有代码更改  
+#problems 检测所有错误和警告
+#new 检查是否需要创建新文件
+#runCell 检查可运行的代码单元
+#installPythonPackage 检查需要安装的依赖包
+#findTestFiles 查找并分析测试文件
+#githubRepo 检查Git仓库状态
+#websearch 搜索相关最佳实践
+#terminalLastCommand 检查终端历史命令
+
+请给出简洁的分析报告，突出关键问题和建议。
