@@ -658,7 +658,7 @@ class SVSDFDemo:
         print("正在初始化Create-3机器人...")
         
         # 加载Create-3机器人USD文件
-        robot_usd_path = "/home/lwb/isaacsim_assets/Assets/Isaac/4.5/Isaac/Robots/iRobot/create_4.usd"
+        robot_usd_path = "/home/lwb/isaacsim_assets/Assets/Isaac/4.5/Isaac/Robots/iRobot/create_3_with_arm.usd"
         
         # 添加机器人到场景
         add_reference_to_stage(robot_usd_path, self.robot_prim_path)
